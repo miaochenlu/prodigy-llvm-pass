@@ -72,6 +72,10 @@ void registerTravEdge(void* src_addr, void* dest_addr, uint32_t edge_type) {
 }
 
 void registerTrigEdge(void* trigger_addr, uint32_t prefetch_params) {
+    // 将trigger edge加入到edges列表中，类型为2（TRIGGER）
+    EdgeInfo edge = {trigger_addr, trigger_addr, 2}; // self-edge with type 2
+    registered_edges.push_back(edge);
+    
     std::cout << "[Prodigy Runtime] Registered Trigger Edge:\n";
     std::cout << "  Trigger Address: " << trigger_addr;
     
@@ -81,29 +85,33 @@ void registerTrigEdge(void* trigger_addr, uint32_t prefetch_params) {
     }
     
     std::cout << "\n  Prefetch Parameters: 0x" << std::hex << prefetch_params << std::dec;
+    std::cout << " (look-ahead: " << (prefetch_params & 0xFF) << ")";
     std::cout << "\n" << std::endl;
 }
 
 // 辅助函数：打印DIG摘要
 __attribute__((destructor))
 void printDIGSummary() {
-    std::cout << "\n[Prodigy Runtime] DIG Summary:\n";
-    std::cout << "  Total Nodes: " << registered_nodes.size() << "\n";
-    std::cout << "  Total Edges: " << registered_edges.size() << "\n";
+    uint32_t totalNodes = registered_nodes.size();
+    uint32_t totalEdges = registered_edges.size();
+    uint32_t singleValuedEdges = 0;
+    uint32_t rangedEdges = 0;
+    uint32_t triggerEdges = 0;
     
-    // 统计边类型
-    int single_valued = 0, ranged = 0, trigger = 0;
     for (const auto& edge : registered_edges) {
         switch (edge.edge_type) {
-            case 0: single_valued++; break;
-            case 1: ranged++; break;
-            case 2: trigger++; break;
+            case 0: singleValuedEdges++; break;
+            case 1: rangedEdges++; break;
+            case 2: triggerEdges++; break;
         }
     }
     
+    std::cout << "\n[Prodigy Runtime] DIG Summary:\n";
+    std::cout << "  Total Nodes: " << totalNodes << "\n";
+    std::cout << "  Total Edges: " << totalEdges << "\n";
     std::cout << "  Edge Types:\n";
-    std::cout << "    Single-valued: " << single_valued << "\n";
-    std::cout << "    Ranged: " << ranged << "\n";
-    std::cout << "    Trigger: " << trigger << "\n";
+    std::cout << "    Single-valued: " << singleValuedEdges << "\n";
+    std::cout << "    Ranged: " << rangedEdges << "\n";
+    std::cout << "    Trigger: " << triggerEdges << "\n";
     std::cout << std::endl;
 } 
