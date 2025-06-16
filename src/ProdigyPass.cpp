@@ -16,6 +16,7 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/IR/CFG.h"
 
 #include "../include/ProdigyDIG.h"
 #include <unordered_map>
@@ -80,9 +81,11 @@ public:
             // Clear function-level state
             functionIndirections.clear();
             registeredEdges.clear();
+            detectedRangedPatterns.clear();
             
             // Identify memory access patterns
             identifySingleValuedIndirections(F);
+            identifyRangedIndirections(F);
             
             // Insert runtime API calls
             insertRuntimeCalls(F);
@@ -171,6 +174,7 @@ private:
     // Function-level tracking
     std::vector<IndirectionInfo> functionIndirections;
     std::unordered_set<EdgeKey, EdgeKeyHash> registeredEdges;
+    std::unordered_set<EdgeKey, EdgeKeyHash> detectedRangedPatterns;
     
     // === Core Methods ===
     
@@ -260,6 +264,7 @@ private:
         
         // Debug output
         errs() << "Found allocation: " << *CI << " (Node ID: " << info.nodeId << ")\n";
+        errs() << "  Base pointer (CI): " << CI << "\n";
         if (info.constantElementSize > 0) {
             errs() << "  Element size: " << info.constantElementSize << " bytes\n";
         }
@@ -749,6 +754,362 @@ private:
     }
     
     /**
+     * @brief Identify ranged indirection patterns (edges[offset[v]:offset[v+1]])
+     */
+    void identifyRangedIndirections(Function &F) {
+        // Alternative approach: Look for pattern directly without requiring canonical loops
+        errs() << "Analyzing function for ranged indirection patterns\n";
+        
+        // Find all loads in the function
+        std::vector<LoadInst*> allLoads;
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                    allLoads.push_back(LI);
+                }
+            }
+        }
+        
+        errs() << "  Found " << allLoads.size() << " load instructions\n";
+        
+        // Look for pairs of loads that could be offset[i] and offset[i+1]
+        for (size_t i = 0; i < allLoads.size(); ++i) {
+            LoadInst *Load1 = allLoads[i];
+            
+            for (size_t j = i + 1; j < allLoads.size(); ++j) {
+                LoadInst *Load2 = allLoads[j];
+                
+                if (areConsecutiveArrayLoads(Load1, Load2)) {
+                    errs() << "  Found consecutive array loads:\n";
+                    errs() << "    Load1: " << *Load1 << "\n";
+                    errs() << "    Load2: " << *Load2 << "\n";
+                    
+                    // Check if these loads are used as loop bounds
+                    checkForRangedPattern(Load1, Load2);
+                }
+            }
+        }
+    }
+    
+    /**
+     * @brief Check if two loads are from consecutive array elements (e.g., A[i] and A[i+1])
+     */
+    bool areConsecutiveArrayLoads(LoadInst *Load1, LoadInst *Load2) {
+        GetElementPtrInst *GEP1 = dyn_cast<GetElementPtrInst>(Load1->getPointerOperand());
+        GetElementPtrInst *GEP2 = dyn_cast<GetElementPtrInst>(Load2->getPointerOperand());
+        
+        if (!GEP1 || !GEP2) return false;
+        
+        // Get the ultimate base pointers (handle cases where base is loaded from memory)
+        Value *Base1 = GEP1->getPointerOperand();
+        Value *Base2 = GEP2->getPointerOperand();
+        
+        // If bases are loads from the same location, they're the same array
+        if (LoadInst *BaseLoad1 = dyn_cast<LoadInst>(Base1)) {
+            if (LoadInst *BaseLoad2 = dyn_cast<LoadInst>(Base2)) {
+                if (BaseLoad1->getPointerOperand() == BaseLoad2->getPointerOperand()) {
+                    // Same array loaded from same location
+                    Base1 = Base2 = BaseLoad1->getPointerOperand();
+                }
+            }
+        }
+        
+        // Check if same base pointer
+        if (Base1 != Base2 && GEP1->getPointerOperand() != GEP2->getPointerOperand()) {
+            return false;
+        }
+        
+        // Check if indices differ by 1
+        if (GEP1->getNumIndices() != 1 || GEP2->getNumIndices() != 1) return false;
+        
+        Value *Idx1 = GEP1->getOperand(1);
+        Value *Idx2 = GEP2->getOperand(1);
+        
+        // Handle sign extension
+        if (SExtInst *SExt1 = dyn_cast<SExtInst>(Idx1)) {
+            Idx1 = SExt1->getOperand(0);
+        }
+        if (SExtInst *SExt2 = dyn_cast<SExtInst>(Idx2)) {
+            Idx2 = SExt2->getOperand(0);
+        }
+        
+        // Check for pattern: idx2 = idx1 + 1
+        if (BinaryOperator *Add = dyn_cast<BinaryOperator>(Idx2)) {
+            if (Add->getOpcode() == Instruction::Add) {
+                Value *AddOp0 = Add->getOperand(0);
+                // Handle case where the index might be loaded from memory
+                if (LoadInst *LI = dyn_cast<LoadInst>(AddOp0)) {
+                    if (LoadInst *LI1 = dyn_cast<LoadInst>(Idx1)) {
+                        if (LI->getPointerOperand() == LI1->getPointerOperand()) {
+                            AddOp0 = Idx1;
+                        }
+                    }
+                }
+                
+                if (AddOp0 == Idx1) {
+                    if (ConstantInt *CI = dyn_cast<ConstantInt>(Add->getOperand(1))) {
+                        if (CI->getSExtValue() == 1) {
+                            errs() << "    Found consecutive loads: " << *Load1 << " and " << *Load2 << "\n";
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * @brief Check if the two loads are used as bounds for accessing another array
+     */
+    void checkForRangedPattern(LoadInst *StartLoad, LoadInst *EndLoad) {
+        errs() << "    Checking for ranged pattern\n";
+        
+        // Trace through store-load chains to find eventual uses
+        std::set<Value*> startValues;
+        std::set<Value*> endValues;
+        
+        startValues.insert(StartLoad);
+        endValues.insert(EndLoad);
+        
+        // Follow store-load chains for start value
+        for (User *U : StartLoad->users()) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+                Value *StoredTo = SI->getPointerOperand();
+                for (User *StoreUser : StoredTo->users()) {
+                    if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
+                        startValues.insert(LI);
+                    }
+                }
+            }
+        }
+        
+        // Follow store-load chains for end value
+        for (User *U : EndLoad->users()) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+                Value *StoredTo = SI->getPointerOperand();
+                for (User *StoreUser : StoredTo->users()) {
+                    if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
+                        endValues.insert(LI);
+                    }
+                }
+            }
+        }
+        
+        // Now look for comparisons using any of these values
+        for (Value *EndVal : endValues) {
+            for (User *EndUser : EndVal->users()) {
+                if (ICmpInst *Cmp = dyn_cast<ICmpInst>(EndUser)) {
+                    errs() << "      Found comparison: " << *Cmp << "\n";
+                    
+                    // Check if comparison involves a value related to start
+                    Value *OtherOp = nullptr;
+                    if (Cmp->getOperand(0) == EndVal) {
+                        OtherOp = Cmp->getOperand(1);
+                    } else if (Cmp->getOperand(1) == EndVal) {
+                        OtherOp = Cmp->getOperand(0);
+                    }
+                    
+                    // Find the basic block containing the loop body
+                    BasicBlock *LoopBB = nullptr;
+                    for (User *CmpUser : Cmp->users()) {
+                        if (BranchInst *BI = dyn_cast<BranchInst>(CmpUser)) {
+                            if (BI->isConditional()) {
+                                LoopBB = BI->getSuccessor(0); // True branch usually contains loop body
+                            }
+                        }
+                    }
+                    
+                    if (LoopBB) {
+                        // Find loads in the loop body
+                        std::vector<LoadInst*> candidateLoads;
+                        for (Instruction &I : *LoopBB) {
+                            if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                                candidateLoads.push_back(LI);
+                            }
+                        }
+                        
+                        errs() << "      Found " << candidateLoads.size() << " loads in loop body\n";
+                        
+                        // Track unique ranged patterns
+                        std::set<std::pair<Value*, Value*>> rangedPatterns;
+                        
+                        // Check each load to see if it's accessing a different array
+                        for (LoadInst *Access : candidateLoads) {
+                            errs() << "        Checking load: " << *Access << "\n";
+                            
+                            // Simple heuristic: if this load is from a different allocation than StartLoad
+                            Value *AccessBase = getBasePointer(Access->getPointerOperand());
+                            Value *StartBase = getBasePointer(StartLoad->getPointerOperand());
+                            
+                            errs() << "          Access base: " << AccessBase << "\n";
+                            errs() << "          Start base: " << StartBase << "\n";
+                            errs() << "          AccessBase in allocations: " 
+                                   << (globalPtrToNodeId.find(AccessBase) != globalPtrToNodeId.end()) << "\n";
+                            errs() << "          StartBase in allocations: " 
+                                   << (globalPtrToNodeId.find(StartBase) != globalPtrToNodeId.end()) << "\n";
+                            
+                            if (AccessBase != StartBase && 
+                                globalPtrToNodeId.find(AccessBase) != globalPtrToNodeId.end() &&
+                                globalPtrToNodeId.find(StartBase) != globalPtrToNodeId.end()) {
+                                
+                                // Check if we've already seen this pattern locally or globally
+                                auto pattern = std::make_pair(StartBase, AccessBase);
+                                if (rangedPatterns.find(pattern) == rangedPatterns.end()) {
+                                    rangedPatterns.insert(pattern);
+                                    
+                                    // Also check at function level
+                                    EdgeKey edgeKey = {StartBase, AccessBase, prodigy::EdgeType::RANGED};
+                                    if (detectedRangedPatterns.find(edgeKey) == detectedRangedPatterns.end()) {
+                                        detectedRangedPatterns.insert(edgeKey);
+                                        
+                                        errs() << "Found ranged indirection pattern:\n";
+                                        errs() << "  Start load: " << *StartLoad << "\n";
+                                        errs() << "  End load: " << *EndLoad << "\n";
+                                        errs() << "  Target access: " << *Access << "\n";
+                                        
+                                        IndirectionInfo info;
+                                        info.srcLoad = StartLoad;
+                                        info.destAccess = Access;
+                                        info.type = prodigy::EdgeType::RANGED;
+                                        
+                                        info.srcBase = StartBase;
+                                        info.destBase = AccessBase;
+                                        
+                                        functionIndirections.push_back(info);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * @brief Find loads that might be ranged accesses
+     */
+    void findLoadsInRangedAccess(BasicBlock *BB, std::vector<LoadInst*> &loads) {
+        // Simple DFS to find loads in blocks reachable from this BB
+        std::set<BasicBlock*> visited;
+        std::queue<BasicBlock*> worklist;
+        worklist.push(BB);
+        
+        while (!worklist.empty()) {
+            BasicBlock *Current = worklist.front();
+            worklist.pop();
+            
+            if (!visited.insert(Current).second) continue;
+            
+            // Collect loads in this block
+            for (Instruction &I : *Current) {
+                if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+                    loads.push_back(LI);
+                }
+            }
+            
+            // Add successors to worklist
+            for (BasicBlock *Succ : successors(Current)) {
+                worklist.push(Succ);
+            }
+            
+            // Limit search depth
+            if (visited.size() > 10) break;
+        }
+    }
+    
+    /**
+     * @brief Check if a load access is part of a ranged pattern
+     */
+    bool isRangedAccess(LoadInst *Access, LoadInst *StartLoad, LoadInst *EndLoad) {
+        // Check if this access uses an index that's initialized from StartLoad
+        // and compared against EndLoad
+        
+        GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Access->getPointerOperand());
+        if (!GEP || GEP->getNumIndices() != 1) return false;
+        
+        Value *Index = GEP->getOperand(1);
+        
+        // Check if Index is in a block that's dominated by stores of StartLoad/EndLoad
+        BasicBlock *AccessBB = Access->getParent();
+        
+        // Simple heuristic: check if StartLoad and EndLoad are in the same function
+        // and appear before this access
+        if (StartLoad->getParent()->getParent() != Access->getParent()->getParent()) {
+            return false;
+        }
+        
+        // Check if there are store instructions that save StartLoad and EndLoad values
+        bool foundStartStore = false;
+        bool foundEndStore = false;
+        
+        // Look for pattern where StartLoad value is stored and then used
+        for (User *U : StartLoad->users()) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+                if (SI->getValueOperand() == StartLoad) {
+                    // Check if the stored value is later loaded and used in comparison with Index
+                    Value *StoredPtr = SI->getPointerOperand();
+                    for (User *PtrUser : StoredPtr->users()) {
+                        if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
+                            if (LI != StartLoad && isRelatedToValue(Index, LI)) {
+                                foundStartStore = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Similar check for EndLoad
+        for (User *U : EndLoad->users()) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+                if (SI->getValueOperand() == EndLoad) {
+                    Value *StoredPtr = SI->getPointerOperand();
+                    for (User *PtrUser : StoredPtr->users()) {
+                        if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
+                            if (LI != EndLoad) {
+                                // Check if this loaded value is used in a comparison
+                                for (User *LIUser : LI->users()) {
+                                    if (ICmpInst *Cmp = dyn_cast<ICmpInst>(LIUser)) {
+                                        if (isRelatedToValue(Cmp->getOperand(0), Index) ||
+                                            isRelatedToValue(Cmp->getOperand(1), Index)) {
+                                            foundEndStore = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return foundStartStore && foundEndStore;
+    }
+    
+    /**
+     * @brief Check if a value is related to another value (direct use or through simple operations)
+     */
+    bool isRelatedToValue(Value *V1, Value *V2) {
+        if (V1 == V2) return true;
+        
+        // Check through simple casts
+        if (CastInst *CI = dyn_cast<CastInst>(V1)) {
+            return isRelatedToValue(CI->getOperand(0), V2);
+        }
+        
+        // Check through simple arithmetic
+        if (BinaryOperator *BO = dyn_cast<BinaryOperator>(V1)) {
+            return isRelatedToValue(BO->getOperand(0), V2) || 
+                   isRelatedToValue(BO->getOperand(1), V2);
+        }
+        
+        return false;
+    }
+    
+    /**
      * @brief Trace a value back to a load instruction through type conversions
      */
     LoadInst* traceToLoad(Value *V) {
@@ -772,6 +1133,15 @@ private:
      * @brief Get the base pointer by following the pointer chain
      */
     Value* getBasePointer(Value *ptr) {
+        // Handle null pointer
+        if (!ptr) return nullptr;
+        
+        // If this is already a known allocation, return it
+        if (globalPtrToNodeId.find(ptr) != globalPtrToNodeId.end()) {
+            return ptr;
+        }
+        
+        // Follow through various instructions
         if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(ptr)) {
             return getBasePointer(GEP->getPointerOperand());
         }
@@ -781,6 +1151,34 @@ private:
         if (PtrToIntInst *PTI = dyn_cast<PtrToIntInst>(ptr)) {
             return getBasePointer(PTI->getOperand(0));
         }
+        if (IntToPtrInst *ITP = dyn_cast<IntToPtrInst>(ptr)) {
+            return getBasePointer(ITP->getOperand(0));
+        }
+        
+        // Handle loads - the pointer might be loaded from memory
+        if (LoadInst *LI = dyn_cast<LoadInst>(ptr)) {
+            // Try to find what was stored to this location
+            Value *LoadedFrom = LI->getPointerOperand();
+            
+            // Look for stores to this location
+            for (User *U : LoadedFrom->users()) {
+                if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+                    if (SI->getPointerOperand() == LoadedFrom) {
+                        Value *StoredVal = SI->getValueOperand();
+                        // Check if the stored value is a known allocation
+                        if (globalPtrToNodeId.find(StoredVal) != globalPtrToNodeId.end()) {
+                            return StoredVal;
+                        }
+                        // Recursively check the stored value
+                        Value *Base = getBasePointer(StoredVal);
+                        if (Base && globalPtrToNodeId.find(Base) != globalPtrToNodeId.end()) {
+                            return Base;
+                        }
+                    }
+                }
+            }
+        }
+        
         return ptr;
     }
     
@@ -835,54 +1233,168 @@ private:
      * @brief Insert registerTravEdge calls for indirection patterns
      */
     void insertEdgeRegistrations(Function &F) {
-        // Collect unique edges
-        std::unordered_map<EdgeKey, std::vector<Instruction*>, EdgeKeyHash> edgeUses;
+        // Collect unique edges grouped by function
+        std::unordered_map<Function*, std::unordered_map<EdgeKey, std::vector<Instruction*>, EdgeKeyHash>> edgesByFunction;
+        
         for (const IndirectionInfo &info : functionIndirections) {
             EdgeKey key = {info.srcBase, info.destBase, info.type};
-            edgeUses[key].push_back(info.destAccess);
+            Function *func = info.destAccess->getFunction();
+            edgesByFunction[func][key].push_back(info.destAccess);
         }
         
-        if (edgeUses.empty()) return;
+        if (edgesByFunction.empty()) return;
         
-        // Find insertion point (after node registrations)
-        BasicBlock &EntryBB = F.getEntryBlock();
-        Instruction *insertPt = nullptr;
-        
-        for (Instruction &I : EntryBB) {
-            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-                if (CI->getCalledFunction() == registerNodeFunc) {
-                    insertPt = CI->getNextNode();
+        // Process edges for each function
+        for (auto &funcPair : edgesByFunction) {
+            Function *func = funcPair.first;
+            auto &edgeUses = funcPair.second;
+            
+            for (const auto &pair : edgeUses) {
+                const EdgeKey &key = pair.first;
+                
+                if (registeredEdges.find(key) != registeredEdges.end()) {
+                    continue;  // Already registered
                 }
+                
+                // Find the allocation instructions for src and dest
+                Instruction *srcAlloc = nullptr;
+                Instruction *destAlloc = nullptr;
+                
+                for (const AllocInfo &alloc : globalAllocations) {
+                    if (alloc.basePtr == key.srcBase) {
+                        srcAlloc = alloc.allocCall;
+                    }
+                    if (alloc.basePtr == key.destBase) {
+                        destAlloc = alloc.allocCall;
+                    }
+                }
+                
+                // Determine insertion point
+                Instruction *insertPt = nullptr;
+                
+                // If both allocations are in the same function, find safe insertion point
+                if (srcAlloc && destAlloc && 
+                    srcAlloc->getFunction() == func && 
+                    destAlloc->getFunction() == func) {
+                    
+                    // Find which allocation comes later in the function
+                    // This handles cases where allocations are in different basic blocks
+                    std::vector<Instruction*> funcInsts;
+                    for (BasicBlock &BB : *func) {
+                        for (Instruction &I : BB) {
+                            funcInsts.push_back(&I);
+                        }
+                    }
+                    
+                    int srcIdx = -1, destIdx = -1;
+                    for (size_t i = 0; i < funcInsts.size(); ++i) {
+                        if (funcInsts[i] == srcAlloc) srcIdx = i;
+                        if (funcInsts[i] == destAlloc) destIdx = i;
+                    }
+                    
+                    // Find the later allocation
+                    Instruction *laterAlloc = (destIdx > srcIdx) ? destAlloc : srcAlloc;
+                    
+                    // Look for registerNode call for the later allocation
+                    for (size_t i = std::max(srcIdx, destIdx); i < funcInsts.size(); ++i) {
+                        if (CallInst *CI = dyn_cast<CallInst>(funcInsts[i])) {
+                            if (CI->getCalledFunction() == registerNodeFunc) {
+                                Value *registeredNode = CI->getArgOperand(0);
+                                if (registeredNode == key.srcBase || registeredNode == key.destBase) {
+                                    // Check if both nodes have been registered by this point
+                                    bool srcRegistered = false, destRegistered = false;
+                                    for (size_t j = 0; j <= i; ++j) {
+                                        if (CallInst *CI2 = dyn_cast<CallInst>(funcInsts[j])) {
+                                            if (CI2->getCalledFunction() == registerNodeFunc) {
+                                                if (CI2->getArgOperand(0) == key.srcBase) srcRegistered = true;
+                                                if (CI2->getArgOperand(0) == key.destBase) destRegistered = true;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (srcRegistered && destRegistered) {
+                                        insertPt = CI->getNextNode();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Strategy: Insert right after both nodes are registered
+                if (!insertPt && srcAlloc && destAlloc) {
+                    // Find where both nodes are registered
+                    BasicBlock &EntryBB = func->getEntryBlock();
+                    Instruction *srcRegister = nullptr;
+                    Instruction *destRegister = nullptr;
+                    
+                    for (Instruction &I : EntryBB) {
+                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                            if (CI->getCalledFunction() == registerNodeFunc) {
+                                if (CI->getArgOperand(0) == key.srcBase) {
+                                    srcRegister = CI;
+                                }
+                                if (CI->getArgOperand(0) == key.destBase) {
+                                    destRegister = CI;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Insert after the last of the two registrations
+                    if (srcRegister && destRegister) {
+                        // Find which comes later
+                        bool srcFirst = true;
+                        for (Instruction &I : EntryBB) {
+                            if (&I == srcRegister) {
+                                srcFirst = true;
+                            } else if (&I == destRegister) {
+                                srcFirst = false;
+                            }
+                        }
+                        insertPt = srcFirst ? destRegister->getNextNode() : srcRegister->getNextNode();
+                    }
+                }
+                
+                // Final fallback: insert at entry
+                if (!insertPt) {
+                    BasicBlock &EntryBB = func->getEntryBlock();
+                    // Look for any registerNode in entry block
+                    for (Instruction &I : EntryBB) {
+                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                            if (CI->getCalledFunction() == registerNodeFunc) {
+                                insertPt = CI->getNextNode();
+                            }
+                        }
+                    }
+                    
+                    if (!insertPt) {
+                        insertPt = &*EntryBB.getFirstInsertionPt();
+                    }
+                }
+                
+                if (!insertPt) {
+                    errs() << "Warning: Could not find suitable insertion point for edge registration\n";
+                    continue;
+                }
+                
+                IRBuilder<> Builder(insertPt);
+                
+                Value *srcCast = key.srcBase;
+                Value *destCast = key.destBase;
+                Value *edgeTypeVal = ConstantInt::get(Type::getInt32Ty(func->getContext()), 
+                                                       static_cast<uint32_t>(key.type));
+                
+                Builder.CreateCall(registerTravEdgeFunc, {srcCast, destCast, edgeTypeVal});
+                
+                errs() << "Inserted registerTravEdge call for edge: " 
+                       << key.srcBase->getName() << " -> " << key.destBase->getName() 
+                       << " in function " << func->getName() << "\n";
+                
+                registeredEdges.insert(key);
+                modified = true;
             }
-        }
-        
-        if (!insertPt) {
-            insertPt = &*EntryBB.getFirstInsertionPt();
-        }
-        
-        IRBuilder<> Builder(insertPt);
-        
-        // Insert edge registrations
-        for (const auto &pair : edgeUses) {
-            const EdgeKey &key = pair.first;
-            
-            if (registeredEdges.find(key) != registeredEdges.end()) {
-                continue;  // Already registered
-            }
-            
-            Value *srcCast = key.srcBase;
-            Value *destCast = key.destBase;
-            Value *edgeTypeVal = ConstantInt::get(Type::getInt32Ty(F.getContext()), 
-                                                   static_cast<uint32_t>(key.type));
-            
-            Builder.CreateCall(registerTravEdgeFunc, {srcCast, destCast, edgeTypeVal});
-            
-            errs() << "Inserted registerTravEdge call for edge: " 
-                   << key.srcBase->getName() << " -> " << key.destBase->getName() 
-                   << " at function entry\n";
-            
-            registeredEdges.insert(key);
-            modified = true;
         }
     }
     
