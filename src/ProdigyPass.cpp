@@ -1,3 +1,11 @@
+#include "ProdigyPass.h"
+#include "ProdigyTypes.h"
+#include "AllocInfo.h"
+#include "BasePointerTracker.h"
+#include "ElementSizeInference.h"
+#include "IndirectionDetector.h"
+#include "DIGInsertion.h"
+
 #include "llvm/Pass.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
@@ -18,7 +26,6 @@
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/CFG.h"
 
-#include "../include/ProdigyDIG.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -26,1436 +33,338 @@
 #include <algorithm>
 #include <queue>
 #include <set>
+#include <cstdio>
+#include <memory>
+
+// Include dig_print.h for the macro definitions
+// This enables printf-based DIG output
+#define DIG_PRINT_MODE 1
+#include "dig_print.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
 
-namespace {
-
-/**
- * @brief Prodigy LLVM Pass - Hardware-Software Co-Design for Prefetching
- * 
- * This pass implements the compiler component of the Prodigy system, which
- * automatically identifies indirect memory access patterns and generates a
- * Data Indirection Graph (DIG) to guide hardware prefetching.
- * 
- * Key features:
- * - Enhanced element size detection for various allocation patterns
- * - Single-valued indirection pattern detection (A[B[i]])
- * - Automatic DIG generation and runtime API instrumentation
- */
-class ProdigyPass : public ModulePass {
-public:
-    static char ID;
-    
-    ProdigyPass() : ModulePass(ID) {}
-    
-    bool runOnModule(Module &M) override {
-        errs() << "Running Prodigy Pass on module: " << M.getName() << "\n";
-        
-        // Initialize module-level analysis
-        DL = &M.getDataLayout();
-        initializeRuntimeFunctions(M);
-        
-        // Clear global state
-        globalAllocations.clear();
-        globalPtrToNodeId.clear();
-        nextNodeId = 0;
-        
-        // Phase 1: Collect all allocations across the module
-        for (Function &F : M) {
-            if (F.isDeclaration()) continue;
-            
-            if (F.getEntryBlock().size() > 0) {
-                SE = &getAnalysis<ScalarEvolutionWrapperPass>(F).getSE();
-                collectAllocations(F);
-            }
-        }
-        
-        // Phase 2: Analyze each function for indirection patterns
-        for (Function &F : M) {
-            if (F.isDeclaration()) continue;
-            
-            errs() << "Analyzing function: " << F.getName() << "\n";
-            
-            // Clear function-level state
-            functionIndirections.clear();
-            registeredEdges.clear();
-            detectedRangedPatterns.clear();
-            
-            // Identify memory access patterns
-            identifySingleValuedIndirections(F);
-            identifyRangedIndirections(F);
-            
-            // Insert runtime API calls
-            insertRuntimeCalls(F);
-        }
-        
-        return modified;
-    }
-    
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-        AU.addRequired<LoopInfoWrapperPass>();
-        AU.addRequired<ScalarEvolutionWrapperPass>();
-        AU.addRequired<MemorySSAWrapperPass>();
-        AU.addRequired<DominatorTreeWrapperPass>();
-    }
-
-private:
-    // === Data Structures ===
-    
-    /**
-     * @brief Information about a memory allocation
-     */
-    struct AllocInfo {
-        CallInst *allocCall;          // The allocation call instruction
-        Value *basePtr;               // Base pointer returned by allocation
-        Value *numElements;           // Number of elements (may be dynamic)
-        Value *elementSize;           // Size of each element (may be dynamic)
-        uint32_t nodeId;              // Unique node ID in the DIG
-        bool registered = false;      // Whether runtime registration is done
-        
-        // Enhanced metadata for element size inference
-        Type *inferredElementType = nullptr;
-        int64_t constantElementSize = -1;  // -1 means unknown
-        int64_t constantNumElements = -1;  // -1 means unknown
-    };
-    
-    /**
-     * @brief Information about an indirect memory access pattern
-     */
-    struct IndirectionInfo {
-        Instruction *srcLoad;         // Source load instruction (B[i])
-        Instruction *destAccess;      // Destination access (A[...])
-        Value *srcBase;              // Base address of source array
-        Value *destBase;             // Base address of destination array
-        prodigy::EdgeType type;      // Type of indirection
-    };
-    
-    /**
-     * @brief Unique identifier for DIG edges
-     */
-    struct EdgeKey {
-        Value *srcBase;
-        Value *destBase;
-        prodigy::EdgeType type;
-        
-        bool operator==(const EdgeKey &other) const {
-            return srcBase == other.srcBase && 
-                   destBase == other.destBase && 
-                   type == other.type;
-        }
-    };
-    
-    struct EdgeKeyHash {
-        std::size_t operator()(const EdgeKey &k) const {
-            return std::hash<void*>()(k.srcBase) ^ 
-                   std::hash<void*>()(k.destBase) ^ 
-                   std::hash<int>()(static_cast<int>(k.type));
-        }
-    };
-    
-    // === Member Variables ===
-    
-    bool modified = false;
-    const DataLayout *DL = nullptr;
-    ScalarEvolution *SE = nullptr;
-    
-    // Runtime function declarations
-    Function *registerNodeFunc = nullptr;
-    Function *registerTravEdgeFunc = nullptr;
-    Function *registerTrigEdgeFunc = nullptr;
-    
-    // Global allocation tracking
-    std::vector<AllocInfo> globalAllocations;
-    std::unordered_map<Value*, uint32_t> globalPtrToNodeId;
-    uint32_t nextNodeId = 0;
-    
-    // Function-level tracking
-    std::vector<IndirectionInfo> functionIndirections;
-    std::unordered_set<EdgeKey, EdgeKeyHash> registeredEdges;
-    std::unordered_set<EdgeKey, EdgeKeyHash> detectedRangedPatterns;
-    
-    // === Core Methods ===
-    
-    /**
-     * @brief Initialize runtime API function declarations
-     */
-    void initializeRuntimeFunctions(Module &M) {
-        LLVMContext &Ctx = M.getContext();
-        
-        // registerNode(void* base_addr, uint64_t num_elements, uint32_t element_size, uint32_t node_id)
-        FunctionType *registerNodeTy = FunctionType::get(
-            Type::getVoidTy(Ctx),
-            {PointerType::getUnqual(Ctx), Type::getInt64Ty(Ctx), 
-             Type::getInt32Ty(Ctx), Type::getInt32Ty(Ctx)},
-            false
-        );
-        registerNodeFunc = cast<Function>(
-            M.getOrInsertFunction("registerNode", registerNodeTy).getCallee()
-        );
-        
-        // registerTravEdge(void* src_addr, void* dest_addr, uint32_t edge_type)
-        FunctionType *registerTravEdgeTy = FunctionType::get(
-            Type::getVoidTy(Ctx),
-            {PointerType::getUnqual(Ctx), PointerType::getUnqual(Ctx), Type::getInt32Ty(Ctx)},
-            false
-        );
-        registerTravEdgeFunc = cast<Function>(
-            M.getOrInsertFunction("registerTravEdge", registerTravEdgeTy).getCallee()
-        );
-        
-        // registerTrigEdge(void* trigger_addr, uint32_t prefetch_params)
-        FunctionType *registerTrigEdgeTy = FunctionType::get(
-            Type::getVoidTy(Ctx),
-            {PointerType::getUnqual(Ctx), Type::getInt32Ty(Ctx)},
-            false
-        );
-        registerTrigEdgeFunc = cast<Function>(
-            M.getOrInsertFunction("registerTrigEdge", registerTrigEdgeTy).getCallee()
-        );
-    }
-    
-    /**
-     * @brief Collect all memory allocations in a function
-     */
-    void collectAllocations(Function &F) {
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-                    Function *Callee = CI->getCalledFunction();
-                    if (!Callee) continue;
-                    
-                    StringRef FuncName = Callee->getName();
-                    
-                    // Detect various allocation functions
-                    if (FuncName == "malloc" || FuncName == "calloc" || 
-                        FuncName == "realloc" || FuncName == "_Znwm" || 
-                        FuncName == "_Znam") {
-                        handleAllocation(CI);
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * @brief Process a memory allocation and infer element size
-     */
-    void handleAllocation(CallInst *CI) {
-        AllocInfo info;
-        info.allocCall = CI;
-        info.basePtr = CI;
-        info.nodeId = nextNodeId++;
-        
-        // Use enhanced element size inference
-        inferElementSizeFromAllocation(info);
-        
-        // Ensure valid element size and count
-        if (!info.elementSize) {
-            info.elementSize = ConstantInt::get(Type::getInt32Ty(CI->getContext()), 1);
-        }
-        if (!info.numElements) {
-            info.numElements = CI->getArgOperand(0);
-        }
-        
-        globalAllocations.push_back(info);
-        globalPtrToNodeId[CI] = info.nodeId;
-        
-        // Debug output
-        errs() << "Found allocation: " << *CI << " (Node ID: " << info.nodeId << ")\n";
-        errs() << "  Base pointer (CI): " << CI << "\n";
-        if (info.constantElementSize > 0) {
-            errs() << "  Element size: " << info.constantElementSize << " bytes\n";
-        }
-        if (info.constantNumElements > 0) {
-            errs() << "  Number of elements: " << info.constantNumElements << "\n";
-        }
-    }
-    
-    // === Element Size Detection Methods ===
-    
-    /**
-     * @brief Main element size inference dispatcher
-     */
-    void inferElementSizeFromAllocation(AllocInfo &info) {
-        CallInst *CI = info.allocCall;
-        Function *Callee = CI->getCalledFunction();
-        if (!Callee) return;
-        
-        StringRef FuncName = Callee->getName();
-        
-        if (FuncName == "malloc") {
-            inferElementSizeFromMalloc(info);
-        } else if (FuncName == "calloc") {
-            inferElementSizeFromCalloc(info);
-        } else if (FuncName == "_Znwm" || FuncName == "_Znam") {
-            inferElementSizeFromNew(info);
-        }
-    }
-    
-    /**
-     * @brief Infer element size from malloc calls using multiple strategies
-     */
-    void inferElementSizeFromMalloc(AllocInfo &info) {
-        Value *sizeArg = info.allocCall->getArgOperand(0);
-        
-        // Try multiple strategies in order of reliability
-        if (analyzeAllocationArgument(sizeArg, info)) {
-            return;  // Pattern matching succeeded
-        }
-        
-        if (analyzeUsagePatterns(info)) {
-            return;  // Usage pattern analysis succeeded
-        }
-        
-        if (analyzeSCEVPatterns(info)) {
-            return;  // SCEV analysis succeeded
-        }
-        
-        // Default: treat as byte array
-        info.elementSize = ConstantInt::get(Type::getInt32Ty(info.allocCall->getContext()), 1);
-        info.numElements = sizeArg;
-        errs() << "  Using default: byte array\n";
-    }
-    
-    /**
-     * @brief Handle calloc which directly provides count and size
-     */
-    void inferElementSizeFromCalloc(AllocInfo &info) {
-        Value *countArg = info.allocCall->getArgOperand(0);
-        Value *sizeArg = info.allocCall->getArgOperand(1);
-        
-        info.numElements = countArg;
-        info.elementSize = sizeArg;
-        
-        // Extract constant values if available
-        if (ConstantInt *CI = dyn_cast<ConstantInt>(sizeArg)) {
-            info.constantElementSize = CI->getSExtValue();
-            
-            // Infer type from size
-            switch (info.constantElementSize) {
-                case 1: info.inferredElementType = Type::getInt8Ty(info.allocCall->getContext()); break;
-                case 2: info.inferredElementType = Type::getInt16Ty(info.allocCall->getContext()); break;
-                case 4: info.inferredElementType = Type::getInt32Ty(info.allocCall->getContext()); break;
-                case 8: info.inferredElementType = Type::getInt64Ty(info.allocCall->getContext()); break;
-            }
-        }
-        
-        if (ConstantInt *CI = dyn_cast<ConstantInt>(countArg)) {
-            info.constantNumElements = CI->getSExtValue();
-        }
-        
-        errs() << "  Calloc: " << info.constantNumElements << " elements of " 
-               << info.constantElementSize << " bytes\n";
-    }
-    
-    /**
-     * @brief Analyze malloc argument patterns (n*size, n<<shift, etc.)
-     */
-    bool analyzeAllocationArgument(Value *sizeArg, AllocInfo &info) {
-        // Pattern 1: n * constant (most common)
-        Value *LHS, *RHS;
-        if (match(sizeArg, m_Mul(m_Value(LHS), m_Value(RHS)))) {
-            ConstantInt *CI = nullptr;
-            Value *Count = nullptr;
-            
-            if ((CI = dyn_cast<ConstantInt>(RHS))) {
-                Count = LHS;
-            } else if ((CI = dyn_cast<ConstantInt>(LHS))) {
-                Count = RHS;
-            }
-            
-            if (CI) {
-                int64_t size = CI->getSExtValue();
-                
-                // Common element sizes
-                if (size == 1 || size == 2 || size == 4 || size == 8 || 
-                    size == 12 || size == 16 || size == 24 || size == 32) {
-                    info.elementSize = CI;
-                    info.numElements = Count;
-                    info.constantElementSize = size;
-                    
-                    errs() << "  Pattern: count * " << size << " (likely element size)\n";
-                    return true;
-                }
-            }
-        }
-        
-        // Pattern 2: count << shift (for power-of-2 sizes)
-        Value *Count;
-        Value *ShiftAmount;
-        if (match(sizeArg, m_Shl(m_Value(Count), m_Value(ShiftAmount)))) {
-            if (ConstantInt *CI = dyn_cast<ConstantInt>(ShiftAmount)) {
-                int64_t shift = CI->getSExtValue();
-                int64_t elemSize = 1LL << shift;
-                
-                info.elementSize = ConstantInt::get(Type::getInt32Ty(sizeArg->getContext()), elemSize);
-                info.numElements = Count;
-                info.constantElementSize = elemSize;
-                
-                errs() << "  Pattern: count << " << shift << " (element size = " << elemSize << ")\n";
-                return true;
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Analyze how allocated memory is used to infer element size
-     */
-    bool analyzeUsagePatterns(AllocInfo &info) {
-        // Collect all memory access operations
-        std::vector<GetElementPtrInst*> geps;
-        std::vector<LoadInst*> loads;
-        std::vector<StoreInst*> stores;
-        std::map<Type*, int> typeFrequency;
-        
-        // BFS traversal of use chain
-        std::queue<Value*> worklist;
-        std::set<Value*> visited;
-        worklist.push(info.basePtr);
-        
-        while (!worklist.empty()) {
-            Value *V = worklist.front();
-            worklist.pop();
-            
-            if (!visited.insert(V).second) continue;
-            
-            for (User *U : V->users()) {
-                if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
-                    geps.push_back(GEP);
-                    worklist.push(GEP);
-                } else if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
-                    loads.push_back(LI);
-                    typeFrequency[LI->getType()]++;
-                } else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                    if (SI->getPointerOperand() == V) {
-                        stores.push_back(SI);
-                        typeFrequency[SI->getValueOperand()->getType()]++;
-                    }
-                } else if (isa<BitCastInst>(U) || isa<PtrToIntInst>(U) || isa<IntToPtrInst>(U)) {
-                    worklist.push(U);
-                }
-            }
-        }
-        
-        // Strategy 1: Most frequent access type
-        Type *mostFrequentType = nullptr;
-        int maxFreq = 0;
-        for (const auto &pair : typeFrequency) {
-            if (pair.second > maxFreq) {
-                maxFreq = pair.second;
-                mostFrequentType = pair.first;
-            }
-        }
-        
-        if (mostFrequentType && maxFreq >= 2) {
-            uint64_t typeSize = DL->getTypeStoreSize(mostFrequentType);
-            
-            // Verify this size makes sense
-            if (ConstantInt *TotalSize = dyn_cast<ConstantInt>(info.numElements)) {
-                int64_t totalBytes = TotalSize->getSExtValue();
-                if (totalBytes >= typeSize && totalBytes % typeSize == 0) {
-                    info.elementSize = ConstantInt::get(Type::getInt32Ty(info.allocCall->getContext()), typeSize);
-                    info.numElements = ConstantInt::get(Type::getInt64Ty(info.allocCall->getContext()), 
-                                                       totalBytes / typeSize);
-                    info.constantElementSize = typeSize;
-                    info.inferredElementType = mostFrequentType;
-                    
-                    errs() << "  Inferred from frequent type: " << *mostFrequentType 
-                           << " (size=" << typeSize << ")\n";
-                    return true;
-                }
-            }
-        }
-        
-        // Strategy 2: Analyze GEP stride patterns
-        if (!geps.empty() && analyzeGEPStrides(geps, info)) {
-            return true;
-        }
-        
-        // Strategy 3: Loop analysis
-        if (analyzeLoopPatterns(info, loads, stores)) {
-            return true;
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Analyze GEP instruction patterns to detect stride
-     */
-    bool analyzeGEPStrides(const std::vector<GetElementPtrInst*> &geps, AllocInfo &info) {
-        std::map<int64_t, int> strideFreq;
-        
-        // Analyze consecutive GEP indices
-        for (size_t i = 0; i < geps.size(); ++i) {
-            GetElementPtrInst *GEP1 = geps[i];
-            if (GEP1->getNumIndices() != 1) continue;
-            
-            Value *Idx1 = GEP1->getOperand(1);
-            ConstantInt *CI1 = dyn_cast<ConstantInt>(Idx1);
-            if (!CI1) continue;
-            
-            for (size_t j = i + 1; j < geps.size(); ++j) {
-                GetElementPtrInst *GEP2 = geps[j];
-                if (GEP2->getNumIndices() != 1) continue;
-                if (GEP2->getPointerOperand() != GEP1->getPointerOperand()) continue;
-                
-                Value *Idx2 = GEP2->getOperand(1);
-                ConstantInt *CI2 = dyn_cast<ConstantInt>(Idx2);
-                if (!CI2) continue;
-                
-                int64_t stride = std::abs(CI2->getSExtValue() - CI1->getSExtValue());
-                if (stride > 0 && stride <= 32) {
-                    strideFreq[stride]++;
-                }
-            }
-        }
-        
-        // Find most common stride
-        int64_t mostCommonStride = 1;
-        int maxStrideFreq = 0;
-        for (const auto &pair : strideFreq) {
-            if (pair.second > maxStrideFreq) {
-                maxStrideFreq = pair.second;
-                mostCommonStride = pair.first;
-            }
-        }
-        
-        // If stride > 1, might indicate element size
-        if (mostCommonStride > 1 && maxStrideFreq >= 2) {
-            // Check if this is byte indexing
-            bool isByteIndexing = false;
-            for (GetElementPtrInst *GEP : geps) {
-                Type *SrcElemTy = GEP->getSourceElementType();
-                if (SrcElemTy->isIntegerTy(8)) {
-                    isByteIndexing = true;
-                    break;
-                }
-            }
-            
-            if (isByteIndexing) {
-                info.elementSize = ConstantInt::get(Type::getInt32Ty(info.allocCall->getContext()), 
-                                                   mostCommonStride);
-                info.constantElementSize = mostCommonStride;
-                
-                if (ConstantInt *TotalSize = dyn_cast<ConstantInt>(info.numElements)) {
-                    int64_t totalBytes = TotalSize->getSExtValue();
-                    info.numElements = ConstantInt::get(Type::getInt64Ty(info.allocCall->getContext()), 
-                                                       totalBytes / mostCommonStride);
-                }
-                
-                errs() << "  Inferred from stride pattern: element size = " << mostCommonStride << "\n";
-                return true;
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Use SCEV analysis for complex access patterns
-     */
-    bool analyzeSCEVPatterns(AllocInfo &info) {
-        if (!SE) return false;
-        
-        // Collect all access instructions
-        std::vector<Instruction*> accesses;
-        for (User *U : info.basePtr->users()) {
-            if (Instruction *I = dyn_cast<Instruction>(U)) {
-                collectAccessInstructions(I, accesses);
-            }
-        }
-        
-        // Analyze access patterns
-        for (Instruction *I : accesses) {
-            if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(I)) {
-                if (GEP->getNumIndices() == 1) {
-                    const SCEV *IndexSCEV = SE->getSCEV(GEP->getOperand(1));
-                    
-                    // Check for affine expressions (a*i + b)
-                    if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(IndexSCEV)) {
-                        if (AR->isAffine()) {
-                            const SCEV *StepSCEV = AR->getStepRecurrence(*SE);
-                            if (const SCEVConstant *Step = dyn_cast<SCEVConstant>(StepSCEV)) {
-                                int64_t stepValue = Step->getAPInt().getSExtValue();
-                                
-                                if (stepValue > 1) {
-                                    errs() << "  SCEV: Found affine access with step " << stepValue << "\n";
-                                    
-                                    info.elementSize = ConstantInt::get(
-                                        Type::getInt32Ty(info.allocCall->getContext()), 
-                                        stepValue);
-                                    info.constantElementSize = stepValue;
-                                    
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Analyze loop patterns for element size inference
-     */
-    bool analyzeLoopPatterns(AllocInfo &info, 
-                           const std::vector<LoadInst*> &loads,
-                           const std::vector<StoreInst*> &stores) {
-        Function *F = info.allocCall->getFunction();
-        LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
-        
-        // Check loads in loops
-        for (LoadInst *LoadI : loads) {
-            if (Loop *L = LI.getLoopFor(LoadI->getParent())) {
-                PHINode *IndVar = L->getCanonicalInductionVariable();
-                if (!IndVar) continue;
-                
-                // Check if load address uses induction variable
-                if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LoadI->getPointerOperand())) {
-                    for (unsigned i = 0; i < GEP->getNumIndices(); ++i) {
-                        Value *Idx = GEP->getOperand(i + 1);
-                        if (isRelatedToInductionVariable(Idx, IndVar)) {
-                            Type *LoadedType = LoadI->getType();
-                            uint64_t typeSize = DL->getTypeStoreSize(LoadedType);
-                            
-                            info.elementSize = ConstantInt::get(
-                                Type::getInt32Ty(info.allocCall->getContext()), typeSize);
-                            info.constantElementSize = typeSize;
-                            info.inferredElementType = LoadedType;
-                            
-                            errs() << "  Loop analysis: element size = " << typeSize << "\n";
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Check if a value is related to an induction variable
-     */
-    bool isRelatedToInductionVariable(Value *V, PHINode *IndVar) {
-        if (V == IndVar) return true;
-        
-        if (BinaryOperator *BO = dyn_cast<BinaryOperator>(V)) {
-            return isRelatedToInductionVariable(BO->getOperand(0), IndVar) ||
-                   isRelatedToInductionVariable(BO->getOperand(1), IndVar);
-        }
-        
-        if (CastInst *CI = dyn_cast<CastInst>(V)) {
-            return isRelatedToInductionVariable(CI->getOperand(0), IndVar);
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Recursively collect memory access instructions
-     */
-    void collectAccessInstructions(Value *V, std::vector<Instruction*> &accesses) {
-        if (!V || isa<Constant>(V)) return;
-        
-        for (User *U : V->users()) {
-            if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
-                accesses.push_back(LI);
-            } else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                if (SI->getPointerOperand() == V) {
-                    accesses.push_back(SI);
-                }
-            } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
-                accesses.push_back(GEP);
-                collectAccessInstructions(GEP, accesses);
-            } else if (isa<BitCastInst>(U) || isa<PtrToIntInst>(U)) {
-                collectAccessInstructions(U, accesses);
-            }
-        }
-    }
-    
-    /**
-     * @brief Handle C++ new/new[] operators
-     */
-    void inferElementSizeFromNew(AllocInfo &info) {
-        Value *sizeArg = info.allocCall->getArgOperand(0);
-        
-        // Check if constant size
-        if (ConstantInt *CI = dyn_cast<ConstantInt>(sizeArg)) {
-            int64_t size = CI->getSExtValue();
-            
-            // Common object sizes
-            if (size % 8 == 0 && size <= 256) {
-                info.elementSize = CI;
-                info.numElements = ConstantInt::get(Type::getInt64Ty(info.allocCall->getContext()), 1);
-                info.constantElementSize = size;
-                errs() << "  New: single object of " << size << " bytes\n";
-                return;
-            }
-        }
-        
-        // Otherwise use malloc analysis
-        inferElementSizeFromMalloc(info);
-    }
-    
-    // === Indirection Pattern Detection ===
-    
-    /**
-     * @brief Identify single-valued indirection patterns (A[B[i]])
-     */
-    void identifySingleValuedIndirections(Function &F) {
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                if (LoadInst *OuterLoad = dyn_cast<LoadInst>(&I)) {
-                    if (GetElementPtrInst *OuterGEP = dyn_cast<GetElementPtrInst>(OuterLoad->getPointerOperand())) {
-                        // Check each index
-                        for (unsigned i = 0; i < OuterGEP->getNumIndices(); ++i) {
-                            Value *Index = OuterGEP->getOperand(i + 1);
-                            
-                            // Trace through type conversions
-                            LoadInst *InnerLoad = traceToLoad(Index);
-                            
-                            if (InnerLoad) {
-                                // Found A[B[i]] pattern!
-                                errs() << "Found single-valued indirection pattern:\n";
-                                errs() << "  Inner load: " << *InnerLoad << "\n";
-                                errs() << "  Outer access: " << *OuterLoad << "\n";
-                                
-                                IndirectionInfo info;
-                                info.srcLoad = InnerLoad;
-                                info.destAccess = OuterLoad;
-                                info.type = prodigy::EdgeType::SINGLE_VALUED;
-                                
-                                // Get base addresses
-                                info.srcBase = getBasePointer(InnerLoad->getPointerOperand());
-                                info.destBase = getBasePointer(OuterGEP->getPointerOperand());
-                                
-                                // Only record if both bases are known allocations
-                                if (globalPtrToNodeId.find(info.srcBase) != globalPtrToNodeId.end() &&
-                                    globalPtrToNodeId.find(info.destBase) != globalPtrToNodeId.end()) {
-                                    functionIndirections.push_back(info);
-                                } else {
-                                    errs() << "  Skipping edge - base addresses not found in allocations\n";
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * @brief Identify ranged indirection patterns (edges[offset[v]:offset[v+1]])
-     */
-    void identifyRangedIndirections(Function &F) {
-        // Alternative approach: Look for pattern directly without requiring canonical loops
-        errs() << "Analyzing function for ranged indirection patterns\n";
-        
-        // Find all loads in the function
-        std::vector<LoadInst*> allLoads;
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
-                    allLoads.push_back(LI);
-                }
-            }
-        }
-        
-        errs() << "  Found " << allLoads.size() << " load instructions\n";
-        
-        // Look for pairs of loads that could be offset[i] and offset[i+1]
-        for (size_t i = 0; i < allLoads.size(); ++i) {
-            LoadInst *Load1 = allLoads[i];
-            
-            for (size_t j = i + 1; j < allLoads.size(); ++j) {
-                LoadInst *Load2 = allLoads[j];
-                
-                if (areConsecutiveArrayLoads(Load1, Load2)) {
-                    errs() << "  Found consecutive array loads:\n";
-                    errs() << "    Load1: " << *Load1 << "\n";
-                    errs() << "    Load2: " << *Load2 << "\n";
-                    
-                    // Check if these loads are used as loop bounds
-                    checkForRangedPattern(Load1, Load2);
-                }
-            }
-        }
-    }
-    
-    /**
-     * @brief Check if two loads are from consecutive array elements (e.g., A[i] and A[i+1])
-     */
-    bool areConsecutiveArrayLoads(LoadInst *Load1, LoadInst *Load2) {
-        GetElementPtrInst *GEP1 = dyn_cast<GetElementPtrInst>(Load1->getPointerOperand());
-        GetElementPtrInst *GEP2 = dyn_cast<GetElementPtrInst>(Load2->getPointerOperand());
-        
-        if (!GEP1 || !GEP2) return false;
-        
-        // Get the ultimate base pointers (handle cases where base is loaded from memory)
-        Value *Base1 = GEP1->getPointerOperand();
-        Value *Base2 = GEP2->getPointerOperand();
-        
-        // If bases are loads from the same location, they're the same array
-        if (LoadInst *BaseLoad1 = dyn_cast<LoadInst>(Base1)) {
-            if (LoadInst *BaseLoad2 = dyn_cast<LoadInst>(Base2)) {
-                if (BaseLoad1->getPointerOperand() == BaseLoad2->getPointerOperand()) {
-                    // Same array loaded from same location
-                    Base1 = Base2 = BaseLoad1->getPointerOperand();
-                }
-            }
-        }
-        
-        // Check if same base pointer
-        if (Base1 != Base2 && GEP1->getPointerOperand() != GEP2->getPointerOperand()) {
-            return false;
-        }
-        
-        // Check if indices differ by 1
-        if (GEP1->getNumIndices() != 1 || GEP2->getNumIndices() != 1) return false;
-        
-        Value *Idx1 = GEP1->getOperand(1);
-        Value *Idx2 = GEP2->getOperand(1);
-        
-        // Handle sign extension
-        if (SExtInst *SExt1 = dyn_cast<SExtInst>(Idx1)) {
-            Idx1 = SExt1->getOperand(0);
-        }
-        if (SExtInst *SExt2 = dyn_cast<SExtInst>(Idx2)) {
-            Idx2 = SExt2->getOperand(0);
-        }
-        
-        // Check for pattern: idx2 = idx1 + 1
-        if (BinaryOperator *Add = dyn_cast<BinaryOperator>(Idx2)) {
-            if (Add->getOpcode() == Instruction::Add) {
-                Value *AddOp0 = Add->getOperand(0);
-                // Handle case where the index might be loaded from memory
-                if (LoadInst *LI = dyn_cast<LoadInst>(AddOp0)) {
-                    if (LoadInst *LI1 = dyn_cast<LoadInst>(Idx1)) {
-                        if (LI->getPointerOperand() == LI1->getPointerOperand()) {
-                            AddOp0 = Idx1;
-                        }
-                    }
-                }
-                
-                if (AddOp0 == Idx1) {
-                    if (ConstantInt *CI = dyn_cast<ConstantInt>(Add->getOperand(1))) {
-                        if (CI->getSExtValue() == 1) {
-                            errs() << "    Found consecutive loads: " << *Load1 << " and " << *Load2 << "\n";
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Check if the two loads are used as bounds for accessing another array
-     */
-    void checkForRangedPattern(LoadInst *StartLoad, LoadInst *EndLoad) {
-        errs() << "    Checking for ranged pattern\n";
-        
-        // Trace through store-load chains to find eventual uses
-        std::set<Value*> startValues;
-        std::set<Value*> endValues;
-        
-        startValues.insert(StartLoad);
-        endValues.insert(EndLoad);
-        
-        // Follow store-load chains for start value
-        for (User *U : StartLoad->users()) {
-            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                Value *StoredTo = SI->getPointerOperand();
-                for (User *StoreUser : StoredTo->users()) {
-                    if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
-                        startValues.insert(LI);
-                    }
-                }
-            }
-        }
-        
-        // Follow store-load chains for end value
-        for (User *U : EndLoad->users()) {
-            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                Value *StoredTo = SI->getPointerOperand();
-                for (User *StoreUser : StoredTo->users()) {
-                    if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
-                        endValues.insert(LI);
-                    }
-                }
-            }
-        }
-        
-        // Now look for comparisons using any of these values
-        for (Value *EndVal : endValues) {
-            for (User *EndUser : EndVal->users()) {
-                if (ICmpInst *Cmp = dyn_cast<ICmpInst>(EndUser)) {
-                    errs() << "      Found comparison: " << *Cmp << "\n";
-                    
-                    // Check if comparison involves a value related to start
-                    Value *OtherOp = nullptr;
-                    if (Cmp->getOperand(0) == EndVal) {
-                        OtherOp = Cmp->getOperand(1);
-                    } else if (Cmp->getOperand(1) == EndVal) {
-                        OtherOp = Cmp->getOperand(0);
-                    }
-                    
-                    // Find the basic block containing the loop body
-                    BasicBlock *LoopBB = nullptr;
-                    for (User *CmpUser : Cmp->users()) {
-                        if (BranchInst *BI = dyn_cast<BranchInst>(CmpUser)) {
-                            if (BI->isConditional()) {
-                                LoopBB = BI->getSuccessor(0); // True branch usually contains loop body
-                            }
-                        }
-                    }
-                    
-                    if (LoopBB) {
-                        // Find loads in the loop body
-                        std::vector<LoadInst*> candidateLoads;
-                        for (Instruction &I : *LoopBB) {
-                            if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
-                                candidateLoads.push_back(LI);
-                            }
-                        }
-                        
-                        errs() << "      Found " << candidateLoads.size() << " loads in loop body\n";
-                        
-                        // Track unique ranged patterns
-                        std::set<std::pair<Value*, Value*>> rangedPatterns;
-                        
-                        // Check each load to see if it's accessing a different array
-                        for (LoadInst *Access : candidateLoads) {
-                            errs() << "        Checking load: " << *Access << "\n";
-                            
-                            // Simple heuristic: if this load is from a different allocation than StartLoad
-                            Value *AccessBase = getBasePointer(Access->getPointerOperand());
-                            Value *StartBase = getBasePointer(StartLoad->getPointerOperand());
-                            
-                            errs() << "          Access base: " << AccessBase << "\n";
-                            errs() << "          Start base: " << StartBase << "\n";
-                            errs() << "          AccessBase in allocations: " 
-                                   << (globalPtrToNodeId.find(AccessBase) != globalPtrToNodeId.end()) << "\n";
-                            errs() << "          StartBase in allocations: " 
-                                   << (globalPtrToNodeId.find(StartBase) != globalPtrToNodeId.end()) << "\n";
-                            
-                            if (AccessBase != StartBase && 
-                                globalPtrToNodeId.find(AccessBase) != globalPtrToNodeId.end() &&
-                                globalPtrToNodeId.find(StartBase) != globalPtrToNodeId.end()) {
-                                
-                                // Check if we've already seen this pattern locally or globally
-                                auto pattern = std::make_pair(StartBase, AccessBase);
-                                if (rangedPatterns.find(pattern) == rangedPatterns.end()) {
-                                    rangedPatterns.insert(pattern);
-                                    
-                                    // Also check at function level
-                                    EdgeKey edgeKey = {StartBase, AccessBase, prodigy::EdgeType::RANGED};
-                                    if (detectedRangedPatterns.find(edgeKey) == detectedRangedPatterns.end()) {
-                                        detectedRangedPatterns.insert(edgeKey);
-                                        
-                                        errs() << "Found ranged indirection pattern:\n";
-                                        errs() << "  Start load: " << *StartLoad << "\n";
-                                        errs() << "  End load: " << *EndLoad << "\n";
-                                        errs() << "  Target access: " << *Access << "\n";
-                                        
-                                        IndirectionInfo info;
-                                        info.srcLoad = StartLoad;
-                                        info.destAccess = Access;
-                                        info.type = prodigy::EdgeType::RANGED;
-                                        
-                                        info.srcBase = StartBase;
-                                        info.destBase = AccessBase;
-                                        
-                                        functionIndirections.push_back(info);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * @brief Find loads that might be ranged accesses
-     */
-    void findLoadsInRangedAccess(BasicBlock *BB, std::vector<LoadInst*> &loads) {
-        // Simple DFS to find loads in blocks reachable from this BB
-        std::set<BasicBlock*> visited;
-        std::queue<BasicBlock*> worklist;
-        worklist.push(BB);
-        
-        while (!worklist.empty()) {
-            BasicBlock *Current = worklist.front();
-            worklist.pop();
-            
-            if (!visited.insert(Current).second) continue;
-            
-            // Collect loads in this block
-            for (Instruction &I : *Current) {
-                if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
-                    loads.push_back(LI);
-                }
-            }
-            
-            // Add successors to worklist
-            for (BasicBlock *Succ : successors(Current)) {
-                worklist.push(Succ);
-            }
-            
-            // Limit search depth
-            if (visited.size() > 10) break;
-        }
-    }
-    
-    /**
-     * @brief Check if a load access is part of a ranged pattern
-     */
-    bool isRangedAccess(LoadInst *Access, LoadInst *StartLoad, LoadInst *EndLoad) {
-        // Check if this access uses an index that's initialized from StartLoad
-        // and compared against EndLoad
-        
-        GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Access->getPointerOperand());
-        if (!GEP || GEP->getNumIndices() != 1) return false;
-        
-        Value *Index = GEP->getOperand(1);
-        
-        // Check if Index is in a block that's dominated by stores of StartLoad/EndLoad
-        BasicBlock *AccessBB = Access->getParent();
-        
-        // Simple heuristic: check if StartLoad and EndLoad are in the same function
-        // and appear before this access
-        if (StartLoad->getParent()->getParent() != Access->getParent()->getParent()) {
-            return false;
-        }
-        
-        // Check if there are store instructions that save StartLoad and EndLoad values
-        bool foundStartStore = false;
-        bool foundEndStore = false;
-        
-        // Look for pattern where StartLoad value is stored and then used
-        for (User *U : StartLoad->users()) {
-            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                if (SI->getValueOperand() == StartLoad) {
-                    // Check if the stored value is later loaded and used in comparison with Index
-                    Value *StoredPtr = SI->getPointerOperand();
-                    for (User *PtrUser : StoredPtr->users()) {
-                        if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
-                            if (LI != StartLoad && isRelatedToValue(Index, LI)) {
-                                foundStartStore = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Similar check for EndLoad
-        for (User *U : EndLoad->users()) {
-            if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                if (SI->getValueOperand() == EndLoad) {
-                    Value *StoredPtr = SI->getPointerOperand();
-                    for (User *PtrUser : StoredPtr->users()) {
-                        if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
-                            if (LI != EndLoad) {
-                                // Check if this loaded value is used in a comparison
-                                for (User *LIUser : LI->users()) {
-                                    if (ICmpInst *Cmp = dyn_cast<ICmpInst>(LIUser)) {
-                                        if (isRelatedToValue(Cmp->getOperand(0), Index) ||
-                                            isRelatedToValue(Cmp->getOperand(1), Index)) {
-                                            foundEndStore = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        return foundStartStore && foundEndStore;
-    }
-    
-    /**
-     * @brief Check if a value is related to another value (direct use or through simple operations)
-     */
-    bool isRelatedToValue(Value *V1, Value *V2) {
-        if (V1 == V2) return true;
-        
-        // Check through simple casts
-        if (CastInst *CI = dyn_cast<CastInst>(V1)) {
-            return isRelatedToValue(CI->getOperand(0), V2);
-        }
-        
-        // Check through simple arithmetic
-        if (BinaryOperator *BO = dyn_cast<BinaryOperator>(V1)) {
-            return isRelatedToValue(BO->getOperand(0), V2) || 
-                   isRelatedToValue(BO->getOperand(1), V2);
-        }
-        
-        return false;
-    }
-    
-    /**
-     * @brief Trace a value back to a load instruction through type conversions
-     */
-    LoadInst* traceToLoad(Value *V) {
-        while (V) {
-            if (LoadInst *LI = dyn_cast<LoadInst>(V)) {
-                return LI;
-            } else if (SExtInst *SExt = dyn_cast<SExtInst>(V)) {
-                V = SExt->getOperand(0);
-            } else if (ZExtInst *ZExt = dyn_cast<ZExtInst>(V)) {
-                V = ZExt->getOperand(0);
-            } else if (TruncInst *Trunc = dyn_cast<TruncInst>(V)) {
-                V = Trunc->getOperand(0);
-            } else {
-                break;
-            }
-        }
-        return nullptr;
-    }
-    
-    /**
-     * @brief Get the base pointer by following the pointer chain
-     */
-    Value* getBasePointer(Value *ptr) {
-        // Handle null pointer
-        if (!ptr) return nullptr;
-        
-        // If this is already a known allocation, return it
-        if (globalPtrToNodeId.find(ptr) != globalPtrToNodeId.end()) {
-            return ptr;
-        }
-        
-        // Follow through various instructions
-        if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(ptr)) {
-            return getBasePointer(GEP->getPointerOperand());
-        }
-        if (BitCastInst *BC = dyn_cast<BitCastInst>(ptr)) {
-            return getBasePointer(BC->getOperand(0));
-        }
-        if (PtrToIntInst *PTI = dyn_cast<PtrToIntInst>(ptr)) {
-            return getBasePointer(PTI->getOperand(0));
-        }
-        if (IntToPtrInst *ITP = dyn_cast<IntToPtrInst>(ptr)) {
-            return getBasePointer(ITP->getOperand(0));
-        }
-        
-        // Handle loads - the pointer might be loaded from memory
-        if (LoadInst *LI = dyn_cast<LoadInst>(ptr)) {
-            // Try to find what was stored to this location
-            Value *LoadedFrom = LI->getPointerOperand();
-            
-            // Look for stores to this location
-            for (User *U : LoadedFrom->users()) {
-                if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-                    if (SI->getPointerOperand() == LoadedFrom) {
-                        Value *StoredVal = SI->getValueOperand();
-                        // Check if the stored value is a known allocation
-                        if (globalPtrToNodeId.find(StoredVal) != globalPtrToNodeId.end()) {
-                            return StoredVal;
-                        }
-                        // Recursively check the stored value
-                        Value *Base = getBasePointer(StoredVal);
-                        if (Base && globalPtrToNodeId.find(Base) != globalPtrToNodeId.end()) {
-                            return Base;
-                        }
-                    }
-                }
-            }
-        }
-        
-        return ptr;
-    }
-    
-    // === Runtime API Instrumentation ===
-    
-    /**
-     * @brief Insert runtime API calls for DIG construction
-     */
-    void insertRuntimeCalls(Function &F) {
-        // 1. Insert node registrations
-        insertNodeRegistrations(F);
-        
-        // 2. Insert edge registrations
-        insertEdgeRegistrations(F);
-        
-        // 3. Insert trigger edges
-        insertTriggerEdges(F);
-    }
-    
-    /**
-     * @brief Insert registerNode calls for allocations in this function
-     */
-    void insertNodeRegistrations(Function &F) {
-        for (AllocInfo &info : globalAllocations) {
-            if (info.allocCall->getFunction() == &F && !info.registered) {
-                IRBuilder<> Builder(info.allocCall->getNextNode());
-                
-                Value *basePtrCast = info.basePtr;
-                Value *numElemsCast = Builder.CreateZExtOrTrunc(
-                    info.numElements, Type::getInt64Ty(F.getContext()));
-                Value *elemSizeCast = Builder.CreateZExtOrTrunc(
-                    info.elementSize, Type::getInt32Ty(F.getContext()));
-                Value *nodeIdVal = ConstantInt::get(
-                    Type::getInt32Ty(F.getContext()), info.nodeId);
-                
-                Builder.CreateCall(registerNodeFunc, 
-                    {basePtrCast, numElemsCast, elemSizeCast, nodeIdVal});
-                
-                errs() << "Inserted registerNode call for node " << info.nodeId;
-                if (info.constantElementSize > 0) {
-                    errs() << " (element_size=" << info.constantElementSize << ")";
-                }
-                errs() << "\n";
-                
-                info.registered = true;
-                modified = true;
-            }
-        }
-    }
-    
-    /**
-     * @brief Insert registerTravEdge calls for indirection patterns
-     */
-    void insertEdgeRegistrations(Function &F) {
-        // Collect unique edges grouped by function
-        std::unordered_map<Function*, std::unordered_map<EdgeKey, std::vector<Instruction*>, EdgeKeyHash>> edgesByFunction;
-        
-        for (const IndirectionInfo &info : functionIndirections) {
-            EdgeKey key = {info.srcBase, info.destBase, info.type};
-            Function *func = info.destAccess->getFunction();
-            edgesByFunction[func][key].push_back(info.destAccess);
-        }
-        
-        if (edgesByFunction.empty()) return;
-        
-        // Process edges for each function
-        for (auto &funcPair : edgesByFunction) {
-            Function *func = funcPair.first;
-            auto &edgeUses = funcPair.second;
-            
-            for (const auto &pair : edgeUses) {
-                const EdgeKey &key = pair.first;
-                
-                if (registeredEdges.find(key) != registeredEdges.end()) {
-                    continue;  // Already registered
-                }
-                
-                // Find the allocation instructions for src and dest
-                Instruction *srcAlloc = nullptr;
-                Instruction *destAlloc = nullptr;
-                
-                for (const AllocInfo &alloc : globalAllocations) {
-                    if (alloc.basePtr == key.srcBase) {
-                        srcAlloc = alloc.allocCall;
-                    }
-                    if (alloc.basePtr == key.destBase) {
-                        destAlloc = alloc.allocCall;
-                    }
-                }
-                
-                // Determine insertion point
-                Instruction *insertPt = nullptr;
-                
-                // If both allocations are in the same function, find safe insertion point
-                if (srcAlloc && destAlloc && 
-                    srcAlloc->getFunction() == func && 
-                    destAlloc->getFunction() == func) {
-                    
-                    // Find which allocation comes later in the function
-                    // This handles cases where allocations are in different basic blocks
-                    std::vector<Instruction*> funcInsts;
-                    for (BasicBlock &BB : *func) {
-                        for (Instruction &I : BB) {
-                            funcInsts.push_back(&I);
-                        }
-                    }
-                    
-                    int srcIdx = -1, destIdx = -1;
-                    for (size_t i = 0; i < funcInsts.size(); ++i) {
-                        if (funcInsts[i] == srcAlloc) srcIdx = i;
-                        if (funcInsts[i] == destAlloc) destIdx = i;
-                    }
-                    
-                    // Find the later allocation
-                    Instruction *laterAlloc = (destIdx > srcIdx) ? destAlloc : srcAlloc;
-                    
-                    // Look for registerNode call for the later allocation
-                    for (size_t i = std::max(srcIdx, destIdx); i < funcInsts.size(); ++i) {
-                        if (CallInst *CI = dyn_cast<CallInst>(funcInsts[i])) {
-                            if (CI->getCalledFunction() == registerNodeFunc) {
-                                Value *registeredNode = CI->getArgOperand(0);
-                                if (registeredNode == key.srcBase || registeredNode == key.destBase) {
-                                    // Check if both nodes have been registered by this point
-                                    bool srcRegistered = false, destRegistered = false;
-                                    for (size_t j = 0; j <= i; ++j) {
-                                        if (CallInst *CI2 = dyn_cast<CallInst>(funcInsts[j])) {
-                                            if (CI2->getCalledFunction() == registerNodeFunc) {
-                                                if (CI2->getArgOperand(0) == key.srcBase) srcRegistered = true;
-                                                if (CI2->getArgOperand(0) == key.destBase) destRegistered = true;
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (srcRegistered && destRegistered) {
-                                        insertPt = CI->getNextNode();
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // Strategy: Insert right after both nodes are registered
-                if (!insertPt && srcAlloc && destAlloc) {
-                    // Find where both nodes are registered
-                    BasicBlock &EntryBB = func->getEntryBlock();
-                    Instruction *srcRegister = nullptr;
-                    Instruction *destRegister = nullptr;
-                    
-                    for (Instruction &I : EntryBB) {
-                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-                            if (CI->getCalledFunction() == registerNodeFunc) {
-                                if (CI->getArgOperand(0) == key.srcBase) {
-                                    srcRegister = CI;
-                                }
-                                if (CI->getArgOperand(0) == key.destBase) {
-                                    destRegister = CI;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Insert after the last of the two registrations
-                    if (srcRegister && destRegister) {
-                        // Find which comes later
-                        bool srcFirst = true;
-                        for (Instruction &I : EntryBB) {
-                            if (&I == srcRegister) {
-                                srcFirst = true;
-                            } else if (&I == destRegister) {
-                                srcFirst = false;
-                            }
-                        }
-                        insertPt = srcFirst ? destRegister->getNextNode() : srcRegister->getNextNode();
-                    }
-                }
-                
-                // Final fallback: insert at entry
-                if (!insertPt) {
-                    BasicBlock &EntryBB = func->getEntryBlock();
-                    // Look for any registerNode in entry block
-                    for (Instruction &I : EntryBB) {
-                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-                            if (CI->getCalledFunction() == registerNodeFunc) {
-                                insertPt = CI->getNextNode();
-                            }
-                        }
-                    }
-                    
-                    if (!insertPt) {
-                        insertPt = &*EntryBB.getFirstInsertionPt();
-                    }
-                }
-                
-                if (!insertPt) {
-                    errs() << "Warning: Could not find suitable insertion point for edge registration\n";
-                    continue;
-                }
-                
-                IRBuilder<> Builder(insertPt);
-                
-                Value *srcCast = key.srcBase;
-                Value *destCast = key.destBase;
-                Value *edgeTypeVal = ConstantInt::get(Type::getInt32Ty(func->getContext()), 
-                                                       static_cast<uint32_t>(key.type));
-                
-                Builder.CreateCall(registerTravEdgeFunc, {srcCast, destCast, edgeTypeVal});
-                
-                errs() << "Inserted registerTravEdge call for edge: " 
-                       << key.srcBase->getName() << " -> " << key.destBase->getName() 
-                       << " in function " << func->getName() << "\n";
-                
-                registeredEdges.insert(key);
-                modified = true;
-            }
-        }
-    }
-    
-    /**
-     * @brief Insert trigger edges for nodes without incoming edges
-     */
-    void insertTriggerEdges(Function &F) {
-        // Collect nodes with incoming edges
-        std::unordered_set<Value*> nodesWithIncomingEdges;
-        
-        for (const EdgeKey &edge : registeredEdges) {
-            nodesWithIncomingEdges.insert(edge.destBase);
-        }
-        
-        for (const IndirectionInfo &info : functionIndirections) {
-            nodesWithIncomingEdges.insert(info.destBase);
-        }
-        
-        // Insert trigger edges for nodes without incoming edges
-        for (const AllocInfo &alloc : globalAllocations) {
-            if (alloc.allocCall->getFunction() == &F && alloc.registered) {
-                if (nodesWithIncomingEdges.find(alloc.basePtr) == nodesWithIncomingEdges.end()) {
-                    // Find where to insert (after registerNode call)
-                    Instruction *insertPt = nullptr;
-                    for (Instruction &I : *alloc.allocCall->getParent()) {
-                        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-                            if (CI->getCalledFunction() == registerNodeFunc) {
-                                if (CI->getArgOperand(0) == alloc.basePtr) {
-                                    insertPt = CI->getNextNode();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (insertPt) {
-                        IRBuilder<> Builder(insertPt);
-                        
-                        Value *triggerCast = alloc.basePtr;
-                        uint32_t prefetchParams = 2; // look-ahead distance
-                        Value *paramsVal = ConstantInt::get(
-                            Type::getInt32Ty(F.getContext()), prefetchParams);
-                        
-                        Builder.CreateCall(registerTrigEdgeFunc, {triggerCast, paramsVal});
-                        
-                        errs() << "Inserted registerTrigEdge call for trigger node: " 
-                               << alloc.basePtr->getName() << " (Node " << alloc.nodeId << ")\n";
-                        
-                        modified = true;
-                    }
-                }
-            }
-        }
-    }
-};
+namespace prodigy {
 
 char ProdigyPass::ID = 0;
 
-} // anonymous namespace
+ProdigyPass::ProdigyPass() : ModulePass(ID) {}
+
+ProdigyPass::~ProdigyPass() {
+    delete pointerTracker;
+    delete elementSizeInference;
+    delete indirectionDetector;
+    delete digInsertion;
+}
+
+bool ProdigyPass::runOnModule(Module &M) {
+    errs() << "\n========================================\n";
+    errs() << "Running Prodigy Pass\n";
+    errs() << "========================================\n\n";
+    
+    // Initialize components
+    pointerTracker = new BasePointerTracker();
+    elementSizeInference = new ElementSizeInference();
+    indirectionDetector = new IndirectionDetector(pointerTracker);
+    digInsertion = new DIGInsertion();
+    
+    // Initialize runtime functions for DIGInsertion
+    digInsertion->initializeRuntimeFunctions(M);
+    
+    // Clear global state
+    globalAllocations.clear();
+    globalIndirections.clear();
+    basePtrMap.clear();
+    nextNodeId = 0;
+    
+    // Phase 1: Collect allocations from all functions
+    errs() << "--- Phase 1: Collecting allocations ---\n";
+    for (Function &F : M) {
+        if (!F.isDeclaration()) {
+            errs() << "Collecting allocations in function: " << F.getName() << "\n";
+            collectAllocations(F);
+        }
+    }
+    
+    // Phase 2: Detect indirections across the module
+    errs() << "\n--- Phase 2: Detecting indirections ---\n";
+    // Comment out module-level detection for now to avoid segfault
+    // indirectionDetector->detectIndirectionsInModule(M);
+    
+    // Run per-function detection
+    for (Function &F : M) {
+        if (!F.isDeclaration()) {
+            detectIndirections(F);
+        }
+    }
+    
+    // Insert global DIG header
+    digInsertion->insertGlobalDIGHeader(M);
+    
+    // Third pass: insert runtime calls
+    errs() << "\n--- Phase 3: Inserting runtime calls ---\n";
+    for (Function &F : M) {
+        if (F.isDeclaration()) continue;
+        
+        // Skip OpenMP runtime functions
+        StringRef FuncName = F.getName();
+        if (FuncName.contains(".omp") || FuncName.contains("__kmpc") || 
+            FuncName.contains("omp_") || FuncName.contains("GOMP")) {
+            continue;
+        }
+        
+        // Get indirections for this function
+        std::vector<IndirectionInfo> indirections;
+        if (globalIndirections.find(&F) != globalIndirections.end()) {
+            indirections = globalIndirections[&F];
+        }
+        
+        digInsertion->insertRuntimeCalls(F, globalAllocations, indirections, registeredEdges);
+    }
+    
+    // Print summary
+    size_t totalIndirections = 0;
+    size_t singleValuedCount = 0;
+    size_t rangedCount = 0;
+    
+    for (const auto& pair : globalIndirections) {
+        const std::vector<IndirectionInfo>& indirections = pair.second;
+        totalIndirections += indirections.size();
+        
+        for (const IndirectionInfo& info : indirections) {
+            if (info.indirectionType == IndirectionType::SingleValued) {
+                singleValuedCount++;
+            } else {
+                rangedCount++;
+            }
+        }
+    }
+    
+    errs() << "\n=== Summary ===\n";
+    errs() << "Total allocations found: " << globalAllocations.size() << "\n";
+    errs() << "Total indirections found: " << totalIndirections << "\n";
+    errs() << "  - Single-valued: " << singleValuedCount << "\n";
+    errs() << "  - Ranged: " << rangedCount << "\n";
+    errs() << "===================\n\n";
+    
+    return modified;
+}
+
+void ProdigyPass::getAnalysisUsage(AnalysisUsage &AU) const {
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+    AU.addRequired<MemorySSAWrapperPass>();
+    AU.addRequired<DominatorTreeWrapperPass>();
+}
+
+void ProdigyPass::collectAllocations(Function &F) {
+    // First pass: collect direct allocations
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+                Function *Callee = CI->getCalledFunction();
+                if (!Callee) continue;
+                
+                StringRef FuncName = Callee->getName();
+                
+                // Detect various allocation functions
+                if (FuncName == "malloc" || FuncName == "calloc" || 
+                    FuncName == "realloc" || FuncName == "_Znwm" || 
+                    FuncName == "_Znam") {
+                    handleAllocation(CI);
+                }
+            }
+        }
+    }
+    
+    // Second pass: track allocations stored in struct members
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+                Value *StoredValue = SI->getValueOperand();
+                Value *StorePtr = SI->getPointerOperand();
+                
+                // Check if we're storing a registered allocation
+                if (pointerTracker->isRegistered(StoredValue)) {
+                    // Check if storing to a struct member (GEP with struct access pattern)
+                    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(StorePtr)) {
+                        if (GEP->getNumIndices() >= 2) {
+                            // Check for struct access pattern (first index is 0)
+                            if (ConstantInt *FirstIdx = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
+                                if (FirstIdx->isZero()) {
+                                    errs() << "Found allocation stored to struct member: " << *SI << "\n";
+                                    
+                                    // Register this GEP pattern with the same node ID
+                                    uint32_t nodeId = pointerTracker->getNodeId(StoredValue);
+                                    pointerTracker->registerPointer(GEP, nodeId);
+                                    
+                                    // Also register the struct pointer if it's an allocation
+                                    Value *StructPtr = GEP->getPointerOperand();
+                                    if (CallInst *StructAlloc = dyn_cast<CallInst>(StructPtr)) {
+                                        if (Function *F = StructAlloc->getCalledFunction()) {
+                                            if (F->getName() == "malloc" || F->getName() == "calloc") {
+                                                errs() << "  Struct itself is allocated: " << *StructAlloc << "\n";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool ProdigyPass::shouldTrackAllocation(CallInst *CI) {
+    // Get the calling function
+    Function *Caller = CI->getFunction();
+    StringRef CallerName = Caller->getName();
+    
+    // Skip allocations in OpenMP runtime functions
+    if (CallerName.startswith("__kmpc_") || 
+        CallerName.startswith(".omp_") ||
+        CallerName.startswith("__kmp_") ||
+        CallerName.contains("omp")) {
+        errs() << "  Skipping OpenMP runtime allocation in " << CallerName << "\n";
+        return false;
+    }
+    
+    // Skip allocations in GOMP (GNU OpenMP) functions
+    if (CallerName.startswith("GOMP_")) {
+        errs() << "  Skipping GOMP allocation in " << CallerName << "\n";
+        return false;
+    }
+    
+    // Skip allocations in system libraries
+    if (CallerName.startswith("__") && !CallerName.startswith("__main")) {
+        errs() << "  Skipping system allocation in " << CallerName << "\n";
+        return false;
+    }
+    
+    // Check if the allocation has a reasonable size (not the suspicious 65536)
+    if (ConstantInt *Size = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
+        uint64_t AllocSize = Size->getZExtValue();
+        if (AllocSize == 65536) {
+            errs() << "  Suspicious allocation size 65536, likely OpenMP stack\n";
+            return false;
+        }
+    }
+    
+    // Track allocations in user functions or main
+    return true;
+}
+
+void ProdigyPass::handleAllocation(CallInst *CI) {
+    // First check if we should track this allocation
+    if (!shouldTrackAllocation(CI)) {
+        return;
+    }
+    
+    AllocInfo alloc;
+    alloc.allocCall = CI;
+    alloc.nodeId = globalAllocations.size();
+    
+    // Handle different allocation functions
+    Function *Callee = CI->getCalledFunction();
+    StringRef FuncName = Callee->getName();
+    
+    // Skip allocations from system/library functions
+    if (shouldFilterAllocation(CI)) {
+        return;
+    }
+    
+    alloc.basePtr = CI;
+    alloc.nodeId = nextNodeId++;
+    
+    // Initialize default values before inference
+    alloc.numElements = nullptr;
+    alloc.elementSize = nullptr;
+    
+    // Use enhanced element size inference
+    elementSizeInference->inferElementSize(alloc);
+    
+    // Ensure valid element size and count
+    if (!alloc.elementSize) {
+        alloc.elementSize = ConstantInt::get(Type::getInt32Ty(CI->getContext()), 1);
+        errs() << "  Warning: Could not infer element size, defaulting to 1\n";
+    }
+    if (!alloc.numElements) {
+        // Try to use the allocation size argument directly
+        if (CI->arg_size() > 0) {
+            alloc.numElements = CI->getArgOperand(0);
+        } else {
+            alloc.numElements = ConstantInt::get(Type::getInt64Ty(CI->getContext()), 1);
+        }
+        errs() << "  Warning: Could not infer number of elements\n";
+    }
+    
+    // Record globally
+    globalAllocations.push_back(alloc);
+    basePtrMap[CI] = &globalAllocations.back();
+    
+    // Register in pointer tracker
+    pointerTracker->registerPointer(alloc.basePtr, alloc.nodeId);
+    
+    // Debug output
+    errs() << "Found allocation: " << *CI << " (Node ID: " << alloc.nodeId << ")\n";
+    errs() << "  Base pointer (result): " << alloc.basePtr << " (type: " << *alloc.basePtr->getType() << ")\n";
+    errs() << "  Stored in map: " << alloc.basePtr << " -> " << alloc.nodeId << "\n";
+    if (alloc.constantElementSize > 0) {
+        errs() << "  Element size: " << alloc.constantElementSize << " bytes\n";
+    }
+    if (alloc.constantNumElements > 0) {
+        errs() << "  Number of elements: " << alloc.constantNumElements << "\n";
+    }
+}
+
+bool ProdigyPass::shouldFilterAllocation(CallInst *CI) {
+    Function *ParentFunc = CI->getFunction();
+    StringRef FuncName = ParentFunc->getName();
+    
+    // Skip OpenMP runtime allocations
+    if (FuncName.contains(".omp") || FuncName.contains("__kmpc") || 
+        FuncName.contains("omp_") || FuncName.contains("GOMP")) {
+        return true;
+    }
+    
+    return false;
+}
+
+void ProdigyPass::detectIndirections(Function &F) {
+    // Use the indirection detector
+    if (!indirectionDetector) {
+        errs() << "Warning: IndirectionDetector not initialized\n";
+        return;
+    }
+    
+    indirectionDetector->clearIndirections();  // Clear previous results
+    indirectionDetector->identifySingleValuedIndirections(F);
+    indirectionDetector->identifyRangedIndirections(F);
+    
+    // Get the results
+    const std::vector<IndirectionInfo>& detectedIndirections = 
+        indirectionDetector->getIndirections();
+    
+    if (!detectedIndirections.empty()) {
+        globalIndirections[&F] = detectedIndirections;
+        errs() << "Function " << F.getName() << ": found " 
+               << detectedIndirections.size() << " indirections\n";
+        
+        for (const IndirectionInfo &info : detectedIndirections) {
+            errs() << "  - " << (info.indirectionType == IndirectionType::SingleValued 
+                              ? "Single-valued" : "Ranged")
+                   << " indirection from node " << info.srcNodeId 
+                   << " to node " << info.destNodeId << "\n";
+        }
+    }
+}
+
+} // namespace prodigy
 
 // Register the pass
+using namespace prodigy;
 static RegisterPass<ProdigyPass> X("prodigy", "Prodigy Hardware Prefetching Pass", false, false);
 
 // LLVM 16 doesn't support new pass manager interface yet
@@ -1476,4 +385,4 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                 });
         }};
 }
-#endif
+#endif 
