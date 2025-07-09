@@ -16,15 +16,17 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
-#include "llvm/Analysis/MemorySSA.h"
-#include "llvm/IR/LegacyPassManager.h"
+// MemorySSA not available in LLVM 3.4.2
+// #include "llvm/Analysis/MemorySSA.h"
+// #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Constants.h"
-#include "llvm/IR/Dominators.h"
+// Not available in LLVM 3.4.2:
+// #include "llvm/IR/Dominators.h" 
 #include "llvm/IR/DataLayout.h"
-#include "llvm/IR/PatternMatch.h"
+// #include "llvm/IR/PatternMatch.h"
 #include "llvm/Analysis/ValueTracking.h"
-#include "llvm/Analysis/ConstantFolding.h"
-#include "llvm/IR/CFG.h"
+// #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Support/CFG.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -42,7 +44,7 @@
 #include "dig_print.h"
 
 using namespace llvm;
-using namespace llvm::PatternMatch;
+// using namespace llvm::PatternMatch;  // Not available in LLVM 3.4.2
 
 namespace prodigy {
 
@@ -108,8 +110,8 @@ bool ProdigyPass::runOnModule(Module &M) {
         
         // Skip OpenMP runtime functions
         StringRef FuncName = F.getName();
-        if (FuncName.contains(".omp") || FuncName.contains("__kmpc") || 
-            FuncName.contains("omp_") || FuncName.contains("GOMP")) {
+        if (FuncName.find(".omp") != StringRef::npos || FuncName.find("__kmpc") != StringRef::npos || 
+            FuncName.find("omp_") != StringRef::npos || FuncName.find("GOMP") != StringRef::npos) {
             continue;
         }
         
@@ -151,10 +153,11 @@ bool ProdigyPass::runOnModule(Module &M) {
 }
 
 void ProdigyPass::getAnalysisUsage(AnalysisUsage &AU) const {
-    AU.addRequired<LoopInfoWrapperPass>();
-    AU.addRequired<ScalarEvolutionWrapperPass>();
-    AU.addRequired<MemorySSAWrapperPass>();
-    AU.addRequired<DominatorTreeWrapperPass>();
+    // LLVM 3.4.2 uses different wrapper names
+    AU.addRequired<LoopInfo>();
+    AU.addRequired<ScalarEvolution>();
+    // MemorySSA and DominatorTree not available in LLVM 3.4.2
+    AU.setPreservesAll();
 }
 
 void ProdigyPass::collectAllocations(Function &F) {
@@ -219,14 +222,14 @@ void ProdigyPass::collectAllocations(Function &F) {
 
 bool ProdigyPass::shouldTrackAllocation(CallInst *CI) {
     // Get the calling function
-    Function *Caller = CI->getFunction();
+    Function *Caller = CI->getParent()->getParent();
     StringRef CallerName = Caller->getName();
     
     // Skip allocations in OpenMP runtime functions
     if (CallerName.startswith("__kmpc_") || 
         CallerName.startswith(".omp_") ||
         CallerName.startswith("__kmp_") ||
-        CallerName.contains("omp")) {
+        CallerName.find("omp") != StringRef::npos) {
         errs() << "  Skipping OpenMP runtime allocation in " << CallerName << "\n";
         return false;
     }
@@ -292,7 +295,7 @@ void ProdigyPass::handleAllocation(CallInst *CI) {
     }
     if (!alloc.numElements) {
         // Try to use the allocation size argument directly
-        if (CI->arg_size() > 0) {
+        if (CI->getNumArgOperands() > 0) {
             alloc.numElements = CI->getArgOperand(0);
         } else {
             alloc.numElements = ConstantInt::get(Type::getInt64Ty(CI->getContext()), 1);
@@ -320,12 +323,12 @@ void ProdigyPass::handleAllocation(CallInst *CI) {
 }
 
 bool ProdigyPass::shouldFilterAllocation(CallInst *CI) {
-    Function *ParentFunc = CI->getFunction();
+    Function *ParentFunc = CI->getParent()->getParent();
     StringRef FuncName = ParentFunc->getName();
     
     // Skip OpenMP runtime allocations
-    if (FuncName.contains(".omp") || FuncName.contains("__kmpc") || 
-        FuncName.contains("omp_") || FuncName.contains("GOMP")) {
+    if (FuncName.find(".omp") != StringRef::npos || FuncName.find("__kmpc") != StringRef::npos || 
+        FuncName.find("omp_") != StringRef::npos || FuncName.find("GOMP") != StringRef::npos) {
         return true;
     }
     

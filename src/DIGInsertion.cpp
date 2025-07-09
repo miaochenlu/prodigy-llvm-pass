@@ -85,11 +85,11 @@ void DIGInsertion::initializeRuntimeFunctions(Module& module) {
     // Initialize printf function for DIG print mode
     FunctionType *printfTy = FunctionType::get(
         Type::getInt32Ty(Ctx),
-        {PointerType::getUnqual(Ctx)},
+        {PointerType::getUnqual(Type::getInt8Ty(Ctx))},
         true  // variadic
     );
-    FunctionCallee printfCallee = module.getOrInsertFunction("printf", printfTy);
-    printfFunc = dyn_cast<Function>(printfCallee.getCallee());
+    // LLVM 3.4.2 compatibility: getOrInsertFunction returns Function*
+    printfFunc = cast<Function>(module.getOrInsertFunction("printf", printfTy));
     
     // Don't create format strings as global variables - they will be created inline
     // when needed in the actual printf calls
@@ -97,20 +97,20 @@ void DIGInsertion::initializeRuntimeFunctions(Module& module) {
     // Create dummy function declarations for compatibility
     FunctionType *registerNodeTy = FunctionType::get(
         Type::getVoidTy(Ctx),
-        {PointerType::getUnqual(Ctx), Type::getInt64Ty(Ctx), 
+        {PointerType::getUnqual(Type::getInt8Ty(Ctx)), Type::getInt64Ty(Ctx), 
          Type::getInt32Ty(Ctx), Type::getInt32Ty(Ctx)},
         false
     );
     
     FunctionType *registerTravEdgeTy = FunctionType::get(
         Type::getVoidTy(Ctx),
-        {PointerType::getUnqual(Ctx), PointerType::getUnqual(Ctx), Type::getInt32Ty(Ctx)},
+        {PointerType::getUnqual(Type::getInt8Ty(Ctx)), PointerType::getUnqual(Type::getInt8Ty(Ctx)), Type::getInt32Ty(Ctx)},
         false
     );
     
     FunctionType *registerTrigEdgeTy = FunctionType::get(
         Type::getVoidTy(Ctx),
-        {PointerType::getUnqual(Ctx), Type::getInt32Ty(Ctx)},
+        {PointerType::getUnqual(Type::getInt8Ty(Ctx)), Type::getInt32Ty(Ctx)},
         false
     );
     
@@ -287,7 +287,7 @@ void DIGInsertion::insertNodeRegistrations(Function &F, const std::vector<AllocI
     LLVMContext &Ctx = F.getContext();
     
     for (const AllocInfo &info : allocations) {
-        if (info.allocCall->getFunction() == &F && !info.registered) {
+        if (info.allocCall->getParent()->getParent() == &F && !info.registered) {
             IRBuilder<> Builder(info.allocCall->getNextNode());
             
             // One-time guard: use a global i1 flag, print only when first seen.
@@ -301,7 +301,8 @@ void DIGInsertion::insertNodeRegistrations(Function &F, const std::vector<AllocI
             }
 
             // Load flag and decide whether to print
-            Value *flagVal = Builder.CreateLoad(printedFlag->getValueType(), printedFlag);
+            // LLVM 3.4.2: Load from pointer type directly
+            Value *flagVal = Builder.CreateLoad(printedFlag);
             Value *needPrint = Builder.CreateICmpEQ(flagVal, ConstantInt::getFalse(Ctx));
 
             std::string formatStr = "NODE %d 0x%lx %ld %ld\n";
@@ -376,7 +377,7 @@ void DIGInsertion::insertEdges(Function &F,
             if (CallInst *CI = dyn_cast<CallInst>(&I)) {
                 if (CI->getCalledFunction() && CI->getCalledFunction()->getName() == "printf") {
                     // Check if this is a NODE registration (has 5 args)
-                    if (CI->arg_size() >= 5) {
+                    if (CI->getNumArgOperands() >= 5) {
                         insertPt = CI->getNextNode();
                     }
                 }
@@ -451,7 +452,7 @@ void DIGInsertion::insertTriggerEdges(Function &F, const std::vector<AllocInfo>&
     
     // Insert trigger edges for nodes without incoming edges
     for (const AllocInfo &alloc : allocations) {
-        if (alloc.allocCall->getFunction() == &F && alloc.registered) {
+        if (alloc.allocCall->getParent()->getParent() == &F && alloc.registered) {
             if (nodesWithIncomingEdges.find(alloc.basePtr) == nodesWithIncomingEdges.end()) {
                 // Find where to insert (after node registration)
                 Instruction *insertPt = alloc.allocCall->getNextNode();
@@ -461,7 +462,7 @@ void DIGInsertion::insertTriggerEdges(Function &F, const std::vector<AllocInfo>&
                     if (CallInst *CI = dyn_cast<CallInst>(&I)) {
                         if (CI->getCalledFunction() && CI->getCalledFunction()->getName() == "printf") {
                             // Check if this is a NODE registration
-                            if (CI->arg_size() >= 5) {  // NODE format has 5 args
+                            if (CI->getNumArgOperands() >= 5) {  // NODE format has 5 args
                                 insertPt = CI->getNextNode();
                             }
                         }
@@ -482,7 +483,8 @@ void DIGInsertion::insertTriggerEdges(Function &F, const std::vector<AllocInfo>&
                     }
                     
                     // Load flag and check if we should print
-                    Value *flagVal = Builder.CreateLoad(printedFlag->getValueType(), printedFlag);
+                    // LLVM 3.4.2: Load from pointer type directly
+            Value *flagVal = Builder.CreateLoad(printedFlag);
                     Value *needPrint = Builder.CreateICmpEQ(flagVal, ConstantInt::getFalse(Ctx));
                     
                     // Create format string for trigger edge

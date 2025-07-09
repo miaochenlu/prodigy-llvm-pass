@@ -33,7 +33,8 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
         errs() << "    -> Is a GlobalVariable\n";
         
         // Look for stores to this global variable
-        for (User *U : GV->users()) {
+        for (Value::use_iterator UI = GV->use_begin(), UE = GV->use_end(); UI != UE; ++UI) {
+            User *U = *UI;
             if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
                 if (SI->getPointerOperand() == GV) {
                     Value *StoredValue = SI->getValueOperand();
@@ -86,7 +87,7 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
                 
                 // Look for stores to the location this struct pointer was loaded from
                 Value *LoadedFrom = StructLoad->getPointerOperand();
-                Module *M = GEP->getModule();
+                Module *M = GEP->getParent()->getParent()->getParent();
                 
                 // Search for stores of registered allocations to struct members
                 for (Function &F : *M) {
@@ -132,7 +133,8 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
         
         // If loading from a global variable, check stores to that global
         if (GlobalVariable *GV = dyn_cast<GlobalVariable>(LoadedFrom)) {
-            for (User *U : GV->users()) {
+            for (Value::use_iterator UI = GV->use_begin(), UE = GV->use_end(); UI != UE; ++UI) {
+            User *U = *UI;
                 if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
                     if (SI->getPointerOperand() == GV) {
                         Value *StoredValue = SI->getValueOperand();
@@ -163,7 +165,7 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
             
             // If loading from a struct field, find all stores to this field
             // across the entire module
-            Module *M = LI->getModule();
+            Module *M = LI->getParent()->getParent()->getParent();
             for (Function &F : *M) {
                 for (BasicBlock &BB : F) {
                     for (Instruction &I : BB) {
@@ -195,7 +197,8 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
         }
         
         // Original logic for simple loads
-        for (User *U : LoadedFrom->users()) {
+        for (Value::use_iterator UI = LoadedFrom->use_begin(), UE = LoadedFrom->use_end(); UI != UE; ++UI) {
+            User *U = *UI;
             if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
                 if (SI->getPointerOperand() == LoadedFrom) {
                     Value *StoredVal = SI->getValueOperand();
@@ -221,7 +224,7 @@ Value* BasePointerTracker::getBasePointer(Value *ptr) {
         // If LoadedFrom is an alloca, look for stores in the same function
         if (AllocaInst *AI = dyn_cast<AllocaInst>(LoadedFrom)) {
             errs() << "       LoadedFrom is an alloca, searching all stores in function\n";
-            Function *F = AI->getFunction();
+            Function *F = AI->getParent()->getParent();
             for (BasicBlock &BB : *F) {
                 for (Instruction &I : BB) {
                     if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {

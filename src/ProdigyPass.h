@@ -60,7 +60,7 @@ public:
     
     void getAnalysisUsage(llvm::AnalysisUsage& AU) const override;
     
-    llvm::StringRef getPassName() const override {
+    const char* getPassName() const override {
         return "Prodigy DIG Construction Pass";
     }
     

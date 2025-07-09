@@ -1,12 +1,12 @@
 #include "ElementSizeInference.h"
-#include "llvm/IR/PatternMatch.h"
+// #include "llvm/IR/PatternMatch.h"  // Not available in LLVM 3.4.2
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Support/raw_ostream.h"
 #include <queue>
 #include <map>
 
 using namespace llvm;
-using namespace llvm::PatternMatch;
+// using namespace llvm::PatternMatch;  // Not available in LLVM 3.4.2
 
 namespace prodigy {
 
@@ -118,17 +118,20 @@ void ElementSizeInference::inferElementSizeFromNew(AllocInfo& info) {
 }
 
 bool ElementSizeInference::analyzeAllocationArgument(Value *sizeArg, AllocInfo& info) {
-    // Pattern 1: n * constant (most common)
-    Value *LHS, *RHS;
-    if (match(sizeArg, m_Mul(m_Value(LHS), m_Value(RHS)))) {
-        ConstantInt *CI = nullptr;
-        Value *Count = nullptr;
-        
-        if ((CI = dyn_cast<ConstantInt>(RHS))) {
-            Count = LHS;
-        } else if ((CI = dyn_cast<ConstantInt>(LHS))) {
-            Count = RHS;
-        }
+    // Pattern 1: n * constant (most common) 
+    // Note: Pattern matching not available in LLVM 3.4.2, use manual analysis
+    if (BinaryOperator *MulOp = dyn_cast<BinaryOperator>(sizeArg)) {
+        if (MulOp->getOpcode() == Instruction::Mul) {
+            Value *LHS = MulOp->getOperand(0);
+            Value *RHS = MulOp->getOperand(1);
+            ConstantInt *CI = nullptr;
+            Value *Count = nullptr;
+            
+            if ((CI = dyn_cast<ConstantInt>(RHS))) {
+                Count = LHS;
+            } else if ((CI = dyn_cast<ConstantInt>(LHS))) {
+                Count = RHS;
+            }
         
         if (CI) {
             int64_t size = CI->getSExtValue();
@@ -144,22 +147,25 @@ bool ElementSizeInference::analyzeAllocationArgument(Value *sizeArg, AllocInfo& 
                 return true;
             }
         }
+        }
     }
     
     // Pattern 2: count << shift (for power-of-2 sizes)
-    Value *Count;
-    Value *ShiftAmount;
-    if (match(sizeArg, m_Shl(m_Value(Count), m_Value(ShiftAmount)))) {
-        if (ConstantInt *CI = dyn_cast<ConstantInt>(ShiftAmount)) {
-            int64_t shift = CI->getSExtValue();
-            int64_t elemSize = 1LL << shift;
-            
-            info.elementSize = ConstantInt::get(Type::getInt32Ty(sizeArg->getContext()), elemSize);
-            info.numElements = Count;
-            info.constantElementSize = elemSize;
-            
-            errs() << "  Pattern: count << " << shift << " (element size = " << elemSize << ")\n";
-            return true;
+    if (BinaryOperator *ShlOp = dyn_cast<BinaryOperator>(sizeArg)) {
+        if (ShlOp->getOpcode() == Instruction::Shl) {
+            Value *Count = ShlOp->getOperand(0);
+            Value *ShiftAmount = ShlOp->getOperand(1);
+            if (ConstantInt *CI = dyn_cast<ConstantInt>(ShiftAmount)) {
+                int64_t shift = CI->getSExtValue();
+                int64_t elemSize = 1LL << shift;
+                
+                info.elementSize = ConstantInt::get(Type::getInt32Ty(sizeArg->getContext()), elemSize);
+                info.numElements = Count;
+                info.constantElementSize = elemSize;
+                
+                errs() << "  Pattern: count << " << shift << " (element size = " << elemSize << ")\n";
+                return true;
+            }
         }
     }
     
@@ -184,7 +190,8 @@ bool ElementSizeInference::analyzeUsagePatterns(AllocInfo& info) {
         
         if (!visited.insert(V).second) continue;
         
-        for (User *U : V->users()) {
+        for (Value::use_iterator UI = V->use_begin(), UE = V->use_end(); UI != UE; ++UI) {
+            User *U = *UI;
             if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
                 geps.push_back(GEP);
                 worklist.push(GEP);
@@ -291,7 +298,9 @@ bool ElementSizeInference::analyzeGEPStrides(const std::vector<GetElementPtrInst
         // Check if this is byte indexing
         bool isByteIndexing = false;
         for (GetElementPtrInst *GEP : geps) {
-            Type *SrcElemTy = GEP->getSourceElementType();
+            // getSourceElementType() not available in LLVM 3.4.2
+            // Use pointed-to type instead
+            Type *SrcElemTy = GEP->getPointerOperandType()->getPointerElementType();
             if (SrcElemTy->isIntegerTy(8)) {
                 isByteIndexing = true;
                 break;
@@ -324,7 +333,8 @@ bool ElementSizeInference::analyzeSCEVPatterns(AllocInfo& info) {
     
     // Collect all access instructions
     std::vector<Instruction*> accesses;
-    for (User *U : info.basePtr->users()) {
+    for (Value::use_iterator UI = info.basePtr->use_begin(), UE = info.basePtr->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (Instruction *I = dyn_cast<Instruction>(U)) {
             collectAccessInstructions(I, accesses);
         }
@@ -341,7 +351,8 @@ bool ElementSizeInference::analyzeSCEVPatterns(AllocInfo& info) {
                     if (AR->isAffine()) {
                         const SCEV *StepSCEV = AR->getStepRecurrence(*SE);
                         if (const SCEVConstant *Step = dyn_cast<SCEVConstant>(StepSCEV)) {
-                            int64_t stepValue = Step->getAPInt().getSExtValue();
+                            // getAPInt() not available in LLVM 3.4.2, use getValue() instead
+                            int64_t stepValue = Step->getValue()->getSExtValue();
                             
                             if (stepValue > 1) {
                                 errs() << "  SCEV: Found affine access with step " << stepValue << "\n";
@@ -366,7 +377,7 @@ bool ElementSizeInference::analyzeSCEVPatterns(AllocInfo& info) {
 bool ElementSizeInference::analyzeLoopPatterns(AllocInfo& info, 
                                                const std::vector<LoadInst*>& loads,
                                                const std::vector<StoreInst*>& stores) {
-    Function *F = info.allocCall->getFunction();
+    Function *F = info.allocCall->getParent()->getParent();
     
     // Note: We need LoopInfo analysis to be available
     // For now, we'll use a simplified pattern matching approach
@@ -411,7 +422,8 @@ bool ElementSizeInference::isRelatedToInductionVariable(Value* V, PHINode* IndVa
 void ElementSizeInference::collectAccessInstructions(Value* V, std::vector<Instruction*>& accesses) {
     if (!V || isa<Constant>(V)) return;
     
-    for (User *U : V->users()) {
+    for (Value::use_iterator UI = V->use_begin(), UE = V->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
             accesses.push_back(LI);
         } else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
@@ -428,7 +440,7 @@ void ElementSizeInference::collectAccessInstructions(Value* V, std::vector<Instr
 }
 
 void ElementSizeInference::inferFromStructAllocation(AllocInfo& info) {
-    Function *F = info.allocCall->getFunction();
+    Function *F = info.allocCall->getParent()->getParent();
     
     errs() << "  Checking for struct allocation patterns...\n";
     // TODO: Implement struct allocation detection

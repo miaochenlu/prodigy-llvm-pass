@@ -3,7 +3,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/CFG.h"
 #include <queue>
 #include <set>
 #include <algorithm>
@@ -81,7 +83,7 @@ void IndirectionDetector::identifySingleValuedIndirections(Function& F) {
     }
     
     // Special handling for BFS-like patterns
-    if (F.getName().contains("TDStep") || F.getName().contains("BFS")) {
+    if (F.getName().find("TDStep") != StringRef::npos || F.getName().find("BFS") != StringRef::npos) {
         detectBFSPatterns(F);
     }
     
@@ -204,13 +206,15 @@ void IndirectionDetector::identifySingleValuedIndirections(Function& F) {
     // Second pass: look for indirect patterns through iterator-like accesses
     for (GetElementPtrInst *GEP : arrayGEPs) {
         // Check if this GEP is used in a load
-        for (User *U : GEP->users()) {
+        for (Value::use_iterator UI = GEP->use_begin(), UE = GEP->use_end(); UI != UE; ++UI) {
+            User *U = *UI;
             if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
                 // This loads from an array
                 Value *ArrayBase = getUltimateBase(GEP->getPointerOperand());
                 
                 // Check if the loaded value is used as an index
-                for (User *LU : LI->users()) {
+                for (Value::use_iterator LUI = LI->use_begin(), LUE = LI->use_end(); LUI != LUE; ++LUI) {
+                    User *LU = *LUI;
                     // Handle various conversions
                     Value *IndexValue = LI;
                     if (SExtInst *SE = dyn_cast<SExtInst>(LU)) {
@@ -220,7 +224,8 @@ void IndirectionDetector::identifySingleValuedIndirections(Function& F) {
                     }
                     
                     // Look for uses in other GEPs
-                    for (User *IU : IndexValue->users()) {
+                    for (Value::use_iterator IUI = IndexValue->use_begin(), IUE = IndexValue->use_end(); IUI != IUE; ++IUI) {
+                        User *IU = *IUI;
                         if (GetElementPtrInst *OuterGEP = dyn_cast<GetElementPtrInst>(IU)) {
                             // Check if this GEP uses our loaded value as index
                             for (unsigned i = 1; i < OuterGEP->getNumOperands(); i++) {
@@ -233,7 +238,8 @@ void IndirectionDetector::identifySingleValuedIndirections(Function& F) {
                                         ArrayBase != DestBase) {
                                         
                                         // Look for loads using this GEP
-                                        for (User *GU : OuterGEP->users()) {
+                                        for (Value::use_iterator GUI = OuterGEP->use_begin(), GUE = OuterGEP->use_end(); GUI != GUE; ++GUI) {
+                                            User *GU = *GUI;
                                             if (LoadInst *FinalLoad = dyn_cast<LoadInst>(GU)) {
                                                 createIndirectionEntry(ArrayBase, DestBase, FinalLoad,
                                                                      IndirectionType::SingleValued);
@@ -404,10 +410,12 @@ void IndirectionDetector::checkForRangedPattern(LoadInst *StartLoad, LoadInst *E
     endValues.insert(EndLoad);
     
     // Follow store-load chains for start value
-    for (User *U : StartLoad->users()) {
+    for (Value::use_iterator UI = StartLoad->use_begin(), UE = StartLoad->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
             Value *StoredTo = SI->getPointerOperand();
-            for (User *StoreUser : StoredTo->users()) {
+            for (Value::use_iterator SUI = StoredTo->use_begin(), SUE = StoredTo->use_end(); SUI != SUE; ++SUI) {
+                User *StoreUser = *SUI;
                 if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
                     startValues.insert(LI);
                 }
@@ -416,10 +424,12 @@ void IndirectionDetector::checkForRangedPattern(LoadInst *StartLoad, LoadInst *E
     }
     
     // Follow store-load chains for end value
-    for (User *U : EndLoad->users()) {
+    for (Value::use_iterator UI = EndLoad->use_begin(), UE = EndLoad->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
             Value *StoredTo = SI->getPointerOperand();
-            for (User *StoreUser : StoredTo->users()) {
+            for (Value::use_iterator SUI = StoredTo->use_begin(), SUE = StoredTo->use_end(); SUI != SUE; ++SUI) {
+                User *StoreUser = *SUI;
                 if (LoadInst *LI = dyn_cast<LoadInst>(StoreUser)) {
                     endValues.insert(LI);
                 }
@@ -429,13 +439,15 @@ void IndirectionDetector::checkForRangedPattern(LoadInst *StartLoad, LoadInst *E
     
     // Now look for comparisons using any of these values
     for (Value *EndVal : endValues) {
-        for (User *EndUser : EndVal->users()) {
+        for (Value::use_iterator EUI = EndVal->use_begin(), EUE = EndVal->use_end(); EUI != EUE; ++EUI) {
+            User *EndUser = *EUI;
             if (ICmpInst *Cmp = dyn_cast<ICmpInst>(EndUser)) {
                 errs() << "      Found comparison: " << *Cmp << "\n";
                 
                 // Find the basic block containing the loop body
                 BasicBlock *LoopBB = nullptr;
-                for (User *CmpUser : Cmp->users()) {
+                for (Value::use_iterator CUI = Cmp->use_begin(), CUE = Cmp->use_end(); CUI != CUE; ++CUI) {
+                    User *CmpUser = *CUI;
                     if (BranchInst *BI = dyn_cast<BranchInst>(CmpUser)) {
                         if (BI->isConditional()) {
                             LoopBB = BI->getSuccessor(0); // True branch usually contains loop body
@@ -544,7 +556,8 @@ void IndirectionDetector::findLoadsInRangedAccess(BasicBlock *BB, std::vector<Lo
         }
         
         // Add successors to worklist
-        for (BasicBlock *Succ : successors(Current)) {
+        for (succ_iterator SI = succ_begin(Current), SE = succ_end(Current); SI != SE; ++SI) {
+            BasicBlock *Succ = *SI;
             worklist.push(Succ);
         }
         
@@ -576,12 +589,14 @@ bool IndirectionDetector::isRangedAccess(LoadInst *Access, LoadInst *StartLoad, 
     bool foundEndStore = false;
     
     // Look for pattern where StartLoad value is stored and then used
-    for (User *U : StartLoad->users()) {
+    for (Value::use_iterator UI = StartLoad->use_begin(), UE = StartLoad->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
             if (SI->getValueOperand() == StartLoad) {
                 // Check if the stored value is later loaded and used in comparison with Index
                 Value *StoredPtr = SI->getPointerOperand();
-                for (User *PtrUser : StoredPtr->users()) {
+                for (Value::use_iterator PUI = StoredPtr->use_begin(), PUE = StoredPtr->use_end(); PUI != PUE; ++PUI) {
+                    User *PtrUser = *PUI;
                     if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
                         if (LI != StartLoad && isRelatedToValue(Index, LI)) {
                             foundStartStore = true;
@@ -593,15 +608,18 @@ bool IndirectionDetector::isRangedAccess(LoadInst *Access, LoadInst *StartLoad, 
     }
     
     // Similar check for EndLoad
-    for (User *U : EndLoad->users()) {
+    for (Value::use_iterator UI = EndLoad->use_begin(), UE = EndLoad->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
             if (SI->getValueOperand() == EndLoad) {
                 Value *StoredPtr = SI->getPointerOperand();
-                for (User *PtrUser : StoredPtr->users()) {
+                for (Value::use_iterator PUI = StoredPtr->use_begin(), PUE = StoredPtr->use_end(); PUI != PUE; ++PUI) {
+                    User *PtrUser = *PUI;
                     if (LoadInst *LI = dyn_cast<LoadInst>(PtrUser)) {
                         if (LI != EndLoad) {
                             // Check if this loaded value is used in a comparison
-                            for (User *LIUser : LI->users()) {
+                            for (Value::use_iterator LUI = LI->use_begin(), LUE = LI->use_end(); LUI != LUE; ++LUI) {
+                                User *LIUser = *LUI;
                                 if (ICmpInst *Cmp = dyn_cast<ICmpInst>(LIUser)) {
                                     if (isRelatedToValue(Cmp->getOperand(0), Index) ||
                                         isRelatedToValue(Cmp->getOperand(1), Index)) {
@@ -653,7 +671,8 @@ LoadInst* IndirectionDetector::traceToLoad(Value *V) {
             // Check if this load is from an alloca (local variable)
             if (AllocaInst *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
                 // Look for stores to this alloca in the same function
-                for (User *U : AI->users()) {
+                for (Value::use_iterator AUI = AI->use_begin(), AUE = AI->use_end(); AUI != AUE; ++AUI) {
+                    User *U = *AUI;
                     if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
                         if (SI->getPointerOperand() == AI) {
                             // Check if the store dominates the load
@@ -704,8 +723,8 @@ void IndirectionDetector::detectIndirectionsInModule(Module &M) {
 bool IndirectionDetector::isSimpleAccessorFunction(Function &F) {
     // Check if function name suggests it's an accessor
     StringRef name = F.getName();
-    if (!name.contains("begin") && !name.contains("end") && 
-        !name.contains("operator") && !name.contains("at")) {
+    if (name.find("begin") == StringRef::npos && name.find("end") == StringRef::npos && 
+        name.find("operator") == StringRef::npos && name.find("at") == StringRef::npos) {
         return false;
     }
     
@@ -782,7 +801,7 @@ void IndirectionDetector::connectAccessorPattern(CallInst *CI, Function *Accesso
     const std::vector<AccessorPattern>& patterns = accessorPatterns[AccessorFunc];
     
     // Get the 'this' pointer passed to the accessor
-    if (CI->arg_size() == 0) return;
+    if (CI->getNumArgOperands() == 0) return;
     Value *ThisArg = CI->getArgOperand(0);
     
     // Try to trace the this pointer to a registered allocation
@@ -907,7 +926,8 @@ void IndirectionDetector::analyzePointerUses(LoadInst* PtrLoad, Value* SourceArr
                                             const std::map<unsigned, Value*>& allMembers) {
     errs() << "      Analyzing uses of loaded pointer\n";
     
-    for (User *U : PtrLoad->users()) {
+    for (Value::use_iterator UI = PtrLoad->use_begin(), UE = PtrLoad->use_end(); UI != UE; ++UI) {
+        User *U = *UI;
         // Case 1: Used in GEP (array access)
         if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
             // Check if the GEP index comes from another array
@@ -921,7 +941,8 @@ void IndirectionDetector::analyzePointerUses(LoadInst* PtrLoad, Value* SourceArr
                     // Check if this creates an indirection pattern
                     if (bpTracker->isRegistered(IdxSrcBase) && bpTracker->isRegistered(SourceArray)) {
                         // Look for loads using this GEP
-                        for (User *GEPUser : GEP->users()) {
+                        for (Value::use_iterator GUI = GEP->use_begin(), GUE = GEP->use_end(); GUI != GUE; ++GUI) {
+                            User *GEPUser = *GUI;
                             if (LoadInst *DataLoad = dyn_cast<LoadInst>(GEPUser)) {
                                 createIndirectionEntry(IdxSrcBase, SourceArray, DataLoad, 
                                                      IndirectionType::SingleValued);
@@ -945,9 +966,9 @@ void IndirectionDetector::analyzePointerUses(LoadInst* PtrLoad, Value* SourceArr
 bool IndirectionDetector::shouldAnalyzeInline(Function* F) {
     // Check function name patterns that suggest graph operations
     StringRef name = F->getName();
-    if (name.contains("neigh") || name.contains("begin") || name.contains("end") ||
-        name.contains("Neighborhood") || name.contains("out_degree") || 
-        name.contains("in_degree") || name.contains("num_nodes")) {
+    if (name.find("neigh") != StringRef::npos || name.find("begin") != StringRef::npos || name.find("end") != StringRef::npos ||
+        name.find("Neighborhood") != StringRef::npos || name.find("out_degree") != StringRef::npos || 
+        name.find("in_degree") != StringRef::npos || name.find("num_nodes") != StringRef::npos) {
         return true;
     }
     
@@ -969,7 +990,7 @@ void IndirectionDetector::analyzeCallSite(CallInst* CI, Function* Callee,
     
     // Special handling for graph-related functions
     StringRef funcName = Callee->getName();
-    if (funcName.contains("Neighborhood") || funcName.contains("begin") || funcName.contains("end")) {
+    if (funcName.find("Neighborhood") != StringRef::npos || funcName.find("begin") != StringRef::npos || funcName.find("end") != StringRef::npos) {
         analyzeNeighborhoodFunction(CI, Callee);
         return;
     }
@@ -978,7 +999,7 @@ void IndirectionDetector::analyzeCallSite(CallInst* CI, Function* Callee,
     std::map<Value*, Value*> argMap;
     unsigned argIdx = 0;
     for (Function::arg_iterator AI = Callee->arg_begin(); AI != Callee->arg_end(); ++AI, ++argIdx) {
-        if (argIdx < CI->arg_size()) {
+        if (argIdx < CI->getNumArgOperands()) {
             argMap[&*AI] = CI->getArgOperand(argIdx);
         }
     }
@@ -1190,7 +1211,7 @@ void IndirectionDetector::analyzeNeighborhoodFunction(CallInst* CI, Function* F)
         if (graphArrays.size() >= 2) {
             // Sort by node ID
             std::sort(graphArrays.begin(), graphArrays.end(), 
-                     [](const auto& a, const auto& b) { return a.second < b.second; });
+                     [](const std::pair<Value*, uint32_t>& a, const std::pair<Value*, uint32_t>& b) { return a.second < b.second; });
             
             // Create ranged patterns between consecutive pairs
             for (size_t i = 0; i < graphArrays.size() - 1; ++i) {
@@ -1209,7 +1230,7 @@ void IndirectionDetector::analyzeNeighborhoodFunction(CallInst* CI, Function* F)
         }
         
         // Also check for single-valued patterns if this is accessing edges
-        if (F->getName().contains("begin") || F->getName().contains("end")) {
+        if (F->getName().find("begin") != StringRef::npos || F->getName().find("end") != StringRef::npos) {
             // These functions return pointers into the edge array
             // Those edges might be used to access other arrays
             for (size_t i = 0; i < graphArrays.size(); ++i) {
